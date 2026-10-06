@@ -16,12 +16,14 @@ def make_epub(tmp_path):
             "EPUB/chapter.xhtml": '''<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Chapter</title></head><body><h1>Chapter</h1><p>Hello.</p></body></html>''',
         }
         with ZipFile(path, "w") as archive:
-            if mode == "valid":
-                archive.writestr("mimetype", b"application/epub+zip", compress_type=ZIP_STORED)
+            if mode in ("valid", "incorrect"):
+                content = b"application/epub+zip" if mode == "valid" else b"application/epub+zip\n"
+                archive.writestr("mimetype", content, compress_type=ZIP_STORED)
             for name, data in files.items():
                 archive.writestr(name, data)
-            if mode == "not_first":
-                archive.writestr("mimetype", b"application/epub+zip", compress_type=ZIP_STORED)
+            if mode in ("not_first", "incorrect_not_first"):
+                content = b"application/epub+zip" if mode == "not_first" else b"wrong"
+                archive.writestr("mimetype", content, compress_type=ZIP_STORED)
             for name, data in (extra or {}).items():
                 archive.writestr(name, data)
         return path

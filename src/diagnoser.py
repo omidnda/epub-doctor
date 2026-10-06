@@ -2,18 +2,22 @@ from zipfile import ZipFile
 
 
 def diagnose_epub(epub_path: str, validation_result: dict) -> list[str]:
-    """Inspect the ZIP to identify the cause of a PKG-006 message."""
-    if not any(
-        message["ID"] == "PKG-006"
-        for message in validation_result["messages"]
-    ):
+    """Confirm mimetype diagnoses for reported PKG-006/PKG-007 messages."""
+    message_ids = {message["ID"] for message in validation_result["messages"]}
+    if not message_ids.intersection({"PKG-006", "PKG-007"}):
         return []
 
+    diagnoses = []
     with ZipFile(epub_path) as archive:
         entries = archive.namelist()
-
-    if "mimetype" not in entries:
-        return ["mimetype_missing"]
-    if entries[0] != "mimetype":
-        return ["mimetype_not_first"]
-    return []
+        if "PKG-006" in message_ids:
+            if "mimetype" not in entries:
+                diagnoses.append("mimetype_missing")
+            elif entries[0] != "mimetype":
+                diagnoses.append("mimetype_not_first")
+        if "PKG-007" in message_ids and entries.count("mimetype") == 1:
+            entry = archive.getinfo("mimetype")
+            # Duplicated, absent, or encrypted entries are not unambiguous repairs.
+            if not (entry.flag_bits & 1) and archive.read(entry) != b"application/epub+zip":
+                diagnoses.append("mimetype_incorrect_content")
+    return diagnoses

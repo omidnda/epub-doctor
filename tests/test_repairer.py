@@ -6,7 +6,12 @@ from src import repairer
 from src.validator import EPUBCheckError
 
 
-@pytest.mark.parametrize("mode,diagnosis", [("missing", "mimetype_missing"), ("not_first", "mimetype_not_first")])
+@pytest.mark.parametrize("mode,diagnosis", [
+    ("missing", ["mimetype_missing"]),
+    ("not_first", ["mimetype_not_first"]),
+    ("incorrect", ["mimetype_incorrect_content"]),
+    ("incorrect_not_first", ["mimetype_not_first", "mimetype_incorrect_content"]),
+])
 def test_real_repair(make_epub, tmp_path, mode, diagnosis):
     source = make_epub(mode)
     original = source.read_bytes()
@@ -14,7 +19,7 @@ def test_real_repair(make_epub, tmp_path, mode, diagnosis):
     result = repairer.repair_epub(str(source), str(output))
     assert result["original_valid"] is False
     assert result["final_valid"] is True, result
-    assert result["detected"] == result["repaired"] == [diagnosis]
+    assert result["detected"] == result["repaired"] == diagnosis
     assert result["remaining_messages"] == []
     assert source.read_bytes() == original
     with ZipFile(source) as before, ZipFile(output) as after:
@@ -23,34 +28,47 @@ def test_real_repair(make_epub, tmp_path, mode, diagnosis):
         assert after.read("mimetype") == b"application/epub+zip"
         assert after.getinfo("mimetype").compress_type == ZIP_STORED
         for entry in before.infolist():
-            assert before.read(entry) == after.read(entry.filename)
+            if entry.filename != "mimetype":
+                copied = after.getinfo(entry.filename)
+                assert before.read(entry) == after.read(copied)
+                assert copied.compress_type == entry.compress_type
+                assert copied.date_time == entry.date_time
+                assert copied.external_attr == entry.external_attr
+                assert copied.extra == entry.extra
+                assert copied.comment == entry.comment
 
 
-def stub(monkeypatch, publication=None):
-    original = {"valid": False, "messages": [{"ID": "PKG-006"}],
+def stub(monkeypatch, publication=None, message_id="PKG-006"):
+    original = {"valid": False, "messages": [{"ID": message_id}],
                 "publication": publication or {}}
     monkeypatch.setattr(repairer, "validate_epub", lambda path: original)
 
 
 @pytest.mark.parametrize("flag", ["hasSignatures", "hasEncryption"])
-def test_metadata_protection(monkeypatch, make_epub, tmp_path, flag):
-    source = make_epub("missing")
-    stub(monkeypatch, {flag: True})
+@pytest.mark.parametrize("mode,message_id", [("missing", "PKG-006"), ("incorrect", "PKG-007")])
+def test_metadata_protection(monkeypatch, make_epub, tmp_path, flag, mode, message_id):
+    source = make_epub(mode)
+    original = source.read_bytes()
+    stub(monkeypatch, {flag: True}, message_id)
     result = repairer.repair_epub(str(source), str(tmp_path / "out.epub"))
     assert result["reason"] == "signatures_or_encryption"
     assert result["output_file"] is None
+    assert source.read_bytes() == original
+    assert set(tmp_path.iterdir()) == {source}
 
 
 @pytest.mark.parametrize("name", ["META-INF/signatures.xml", "META-INF/encryption.xml"])
-def test_archive_protection(monkeypatch, make_epub, tmp_path, name):
-    source = make_epub("missing", {name: ""})
-    stub(monkeypatch)
+@pytest.mark.parametrize("mode,message_id", [("missing", "PKG-006"), ("incorrect", "PKG-007")])
+def test_archive_protection(monkeypatch, make_epub, tmp_path, name, mode, message_id):
+    source = make_epub(mode, {name: ""})
+    stub(monkeypatch, message_id=message_id)
     assert repairer.repair_epub(str(source), str(tmp_path / "out.epub"))["reason"] == "signatures_or_encryption"
 
 
-def test_existing_output_and_same_path(monkeypatch, make_epub, tmp_path):
-    source = make_epub("missing")
-    stub(monkeypatch)
+@pytest.mark.parametrize("mode,message_id", [("missing", "PKG-006"), ("incorrect", "PKG-007")])
+def test_existing_output_and_same_path(monkeypatch, make_epub, tmp_path, mode, message_id):
+    source = make_epub(mode)
+    stub(monkeypatch, message_id=message_id)
     assert repairer.repair_epub(str(source), str(source))["reason"] == "output_is_input"
     output = tmp_path / "out.epub"
     output.write_bytes(b"keep")
@@ -117,11 +135,12 @@ def test_already_valid(make_epub, tmp_path):
     assert result["output_file"] is None
 
 
-def test_duplicate_entries(monkeypatch, make_epub, tmp_path):
-    source = make_epub("not_first")
+@pytest.mark.parametrize("mode,message_id", [("not_first", "PKG-006"), ("incorrect", "PKG-007")])
+def test_duplicate_entries(monkeypatch, make_epub, tmp_path, mode, message_id):
+    source = make_epub(mode)
     with pytest.warns(UserWarning), ZipFile(source, "a") as archive:
         archive.writestr("mimetype", b"application/epub+zip")
-    stub(monkeypatch)
+    stub(monkeypatch, message_id=message_id)
     assert repairer.repair_epub(str(source), str(tmp_path / "out.epub"))["reason"] == "duplicate_zip_entries"
 
 
@@ -169,16 +188,18 @@ def test_publication_failure_cleans_temporary(monkeypatch, make_epub, tmp_path):
     assert set(tmp_path.iterdir()) == {source}
 
 
-def test_real_remaining_errors(make_epub, tmp_path):
-    source = make_epub("missing")
-    # Damage another part: PKG-006 repair must not claim full success.
+@pytest.mark.parametrize("mode,diagnosis", [("missing", "mimetype_missing"), ("incorrect", "mimetype_incorrect_content")])
+def test_real_remaining_errors(make_epub, tmp_path, mode, diagnosis):
+    source = make_epub(mode)
+    # Damage another part: mimetype repair must not claim full success.
     with ZipFile(source) as archive:
         entries = [(info.filename, archive.read(info)) for info in archive.infolist()]
     with ZipFile(source, "w") as archive:
         for name, data in entries:
             archive.writestr(name, b"<broken>" if name == "EPUB/chapter.xhtml" else data)
+    original = source.read_bytes()
     result = repairer.repair_epub(str(source), str(tmp_path / "out.epub"))
-    assert result["detected"] == ["mimetype_missing"]
+    assert result["detected"] == [diagnosis]
     assert result["reason"] == "revalidation_failed"
     assert result["final_valid"] is False
     assert result["repaired"] == []
@@ -186,11 +207,13 @@ def test_real_remaining_errors(make_epub, tmp_path):
     assert all(msg["ID"] != "PKG-006" for msg in result["remaining_messages"])
     assert result["output_file"] is None
     assert set(tmp_path.iterdir()) == {source}
+    assert source.read_bytes() == original
 
 
 @pytest.mark.parametrize("compression", [ZIP_STORED, ZIP_DEFLATED, ZIP_BZIP2, ZIP_LZMA])
-def test_preserves_compression(monkeypatch, make_epub, tmp_path, compression):
-    source = make_epub("missing")
+@pytest.mark.parametrize("mode,message_id,diagnosis", [("missing", "PKG-006", "mimetype_missing"), ("incorrect", "PKG-007", "mimetype_incorrect_content")])
+def test_preserves_compression(monkeypatch, make_epub, tmp_path, compression, mode, message_id, diagnosis):
+    source = make_epub(mode)
     with ZipFile(source) as archive:
         entries = [(info.filename, archive.read(info)) for info in archive.infolist()]
     with ZipFile(source, "w") as archive:
@@ -198,21 +221,22 @@ def test_preserves_compression(monkeypatch, make_epub, tmp_path, compression):
             archive.writestr(name, data, compress_type=compression if index % 2 else ZIP_STORED)
     original = source.read_bytes()
     reports = iter([
-        {"valid": False, "messages": [{"ID": "PKG-006"}], "publication": {}},
+        {"valid": False, "messages": [{"ID": message_id}], "publication": {}},
         {"valid": True, "messages": [], "publication": {}},
     ])
     monkeypatch.setattr(repairer, "validate_epub", lambda path: next(reports))
     output = tmp_path / "out.epub"
     result = repairer.repair_epub(str(source), str(output))
-    assert result["repaired"] == ["mimetype_missing"]
+    assert result["repaired"] == [diagnosis]
     assert source.read_bytes() == original
     with ZipFile(source) as before, ZipFile(output) as after:
         assert after.namelist()[0] == "mimetype"
         assert after.read("mimetype") == b"application/epub+zip"
         assert after.getinfo("mimetype").compress_type == ZIP_STORED
         for entry in before.infolist():
-            assert after.getinfo(entry.filename).compress_type == entry.compress_type
-            assert after.read(entry.filename) == before.read(entry)
+            if entry.filename != "mimetype":
+                assert after.getinfo(entry.filename).compress_type == entry.compress_type
+                assert after.read(entry.filename) == before.read(entry)
 
 
 @pytest.mark.parametrize("symlink", [False, True])
@@ -258,9 +282,10 @@ def test_publication_without_hard_links(monkeypatch, make_epub, tmp_path):
     assert set(tmp_path.iterdir()) == {source, output}
 
 
-def test_unsupported_compression_is_not_converted(monkeypatch, make_epub, tmp_path):
-    source = make_epub("missing")
-    stub(monkeypatch)
+@pytest.mark.parametrize("mode,message_id", [("missing", "PKG-006"), ("incorrect", "PKG-007")])
+def test_unsupported_compression_is_not_converted(monkeypatch, make_epub, tmp_path, mode, message_id):
+    source = make_epub(mode)
+    stub(monkeypatch, message_id=message_id)
     original_infolist = ZipFile.infolist
     def unsupported_infolist(archive):
         entries = original_infolist(archive)

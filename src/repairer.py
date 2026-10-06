@@ -11,7 +11,7 @@ MIMETYPE = b"application/epub+zip"
 
 
 def repair_epub(input_path: str, output_path: str) -> dict:
-    """Repair only missing/misordered mimetype entries; EPUBCheck decides validity.
+    """Repair PKG-006/PKG-007 mimetype issues; EPUBCheck decides validity.
 
     Existing output files are never replaced. `repaired` is populated only
     after a valid recheck and successful publication of the new output.
@@ -41,9 +41,6 @@ def repair_epub(input_path: str, output_path: str) -> dict:
             if original["valid"]:
                 result["reason"] = "already_valid"
                 return result
-            if not result["detected"]:
-                result["reason"] = "no_supported_repair"
-                return result
             publication = original["publication"]
             if (publication.get("hasSignatures") or publication.get("hasEncryption")
                     or "META-INF/signatures.xml" in names
@@ -54,7 +51,11 @@ def repair_epub(input_path: str, output_path: str) -> dict:
             if len(names) != len(set(names)):
                 result["reason"] = "duplicate_zip_entries"
                 return result
-            if "mimetype" in names and archive.read("mimetype") != MIMETYPE:
+            if not result["detected"]:
+                result["reason"] = "no_supported_repair"
+                return result
+            if ("mimetype" in names and archive.read("mimetype") != MIMETYPE
+                    and "mimetype_incorrect_content" not in result["detected"]):
                 result["reason"] = "unsupported_mimetype_content"
                 return result
             if source.resolve() == destination.resolve():

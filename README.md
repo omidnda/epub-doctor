@@ -11,7 +11,7 @@ result = repair_epub("book.epub", "book-repaired.epub")
 print(result)
 ```
 
-Flow: validate original → diagnose PKG-006 using ZIP entry order → rebuild
+Flow: validate original → diagnose PKG-006/PKG-007 using ZIP entries → rebuild
 into a temporary archive → revalidate → publish a separate output.
 The original and any existing output are never overwritten. ZIP entries are
 copied directly without extracting paths to disk. After successful revalidation,
@@ -19,13 +19,18 @@ output is created exclusively (`xb`) and copied from the validated archive.
 This prevents overwrites without requiring hard links. The copy is not atomically
 visible; a failed copy is removed and returns `output_write_failed`.
 
-Only `mimetype_missing` and `mimetype_not_first` are supported. The rebuilt
+Only `mimetype_missing`, `mimetype_not_first` (PKG-006), and
+`mimetype_incorrect_content` (PKG-007) are supported. Content diagnosis requires
+an EPUBCheck PKG-007 message and exactly one readable, unencrypted root mimetype
+entry whose bytes differ from the required value. The same rebuild handles
+these diagnoses, including combined PKG-006/PKG-007 errors. The rebuilt
 archive starts with exactly `b"application/epub+zip"`, uncompressed; remaining
 entries retain their original compression methods where supported by Python's
 zipfile implementation. Unsupported methods are refused rather than converted.
-Existing mimetype entries are not duplicated. Incorrect
-existing mimetype content, duplicate ZIP entries, signatures and encryption
-are refused. Other EPUBCheck error IDs are not repaired.
+Existing mimetype entries are not duplicated. Incorrect content without a
+PKG-007 message, duplicate ZIP entries, signatures and encryption are refused.
+Missing root entries are not diagnosed as PKG-007; they require PKG-006.
+Other EPUBCheck error IDs are not repaired.
 
 `original_valid` and `final_valid` are EPUBCheck results (`None` when unknown).
 `detected` records diagnoses. `repaired` is populated only when revalidation
@@ -39,7 +44,7 @@ Already valid files and unsupported repairs produce no output.
 
 Low-level `validate_epub` raises `FileNotFoundError` for a missing input and
 `EPUBCheckError` for execution/report failures. Validation exit code 1 is a
-normal invalid result. `diagnose_epub` inspects ZIPs only for PKG-006 and raises
+normal invalid result. `diagnose_epub` inspects ZIPs only for PKG-006/PKG-007 and raises
 standard ZIP/I/O exceptions for unreadable archives; orchestration converts
 these failures into structured results.
 
@@ -51,5 +56,5 @@ these failures into structured results.
 ```
 
 Tests generate small EPUB fixtures in temporary directories, including real
-EPUBCheck validation and repair/revalidation of both PKG-006 causes. They
+EPUBCheck validation and repair/revalidation of both PKG-006 causes and PKG-007. They
 require the bundled JAR and Java; no Downloads files or network fixtures.
