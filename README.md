@@ -14,13 +14,16 @@ print(result)
 Flow: validate original → diagnose PKG-006 using ZIP entry order → rebuild
 into a temporary archive → revalidate → publish a separate output.
 The original and any existing output are never overwritten. ZIP entries are
-copied directly without extracting paths to disk. Output publication uses an
-exclusive hard link on the destination filesystem; unsupported filesystems
-return `output_write_failed`.
+copied directly without extracting paths to disk. After successful revalidation,
+output is created exclusively (`xb`) and copied from the validated archive.
+This prevents overwrites without requiring hard links. The copy is not atomically
+visible; a failed copy is removed and returns `output_write_failed`.
 
 Only `mimetype_missing` and `mimetype_not_first` are supported. The rebuilt
 archive starts with exactly `b"application/epub+zip"`, uncompressed; remaining
-entries use deflate. Existing mimetype entries are not duplicated. Incorrect
+entries retain their original compression methods where supported by Python's
+zipfile implementation. Unsupported methods are refused rather than converted.
+Existing mimetype entries are not duplicated. Incorrect
 existing mimetype content, duplicate ZIP entries, signatures and encryption
 are refused. Other EPUBCheck error IDs are not repaired.
 
@@ -29,8 +32,9 @@ are refused. Other EPUBCheck error IDs are not repaired.
 passes and output publication succeeds. `remaining_messages` retains the
 latest validation messages. `output_file` is set only after publication.
 `reason` and optional `detail` explain refusals/failures. A rebuilt EPUB with
-remaining validation errors is published for inspection with
-`reason="revalidation_failed"`, `final_valid=False`, and `repaired=[]`.
+remaining validation errors is deleted, with `reason="revalidation_failed"`,
+`final_valid=False`, `output_file=None`, and `repaired=[]`; validation messages
+are preserved.
 Already valid files and unsupported repairs produce no output.
 
 Low-level `validate_epub` raises `FileNotFoundError` for a missing input and

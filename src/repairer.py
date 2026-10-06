@@ -1,7 +1,7 @@
-import os
+import shutil
 import tempfile
 from pathlib import Path
-from zipfile import BadZipFile, ZIP_DEFLATED, ZIP_STORED, ZipFile
+from zipfile import BadZipFile, ZIP_STORED, ZipFile
 
 from .diagnoser import diagnose_epub
 from .validator import EPUBCheckError, validate_epub
@@ -27,6 +27,7 @@ def repair_epub(input_path: str, output_path: str) -> dict:
         "reason": None,
     }
     temporary_path = None
+    output_created = False
     stage = "input"
     try:
         original = validate_epub(str(source))
@@ -72,21 +73,25 @@ def repair_epub(input_path: str, output_path: str) -> dict:
                 rebuilt.writestr("mimetype", MIMETYPE, compress_type=ZIP_STORED)
                 for entry in entries:
                     if entry.filename != "mimetype":
-                        # Preserve entry metadata and bytes, with new ZIP compression.
+                        # Preserve metadata, bytes, and the original compression method.
                         rebuilt.writestr(entry, archive.read(entry),
-                                         compress_type=ZIP_DEFLATED)
+                                         compress_type=entry.compress_type)
 
         stage = "revalidation"
         final = validate_epub(str(temporary_path))
         result.update(final_valid=final["valid"], remaining_messages=final["messages"])
-        stage = "output"
-        # Atomic, exclusive publication: a concurrent writer cannot be overwritten.
-        os.link(temporary_path, destination)
-        result["output_file"] = str(destination)
-        if final["valid"]:
-            result["repaired"] = result["detected"].copy()
-        else:
+        if not final["valid"]:
             result["reason"] = "revalidation_failed"
+            return result
+        stage = "output"
+        # Exclusive creation prevents overwrite even if a writer races the precheck.
+        # Copying is portable, but the destination is visible while it is written.
+        with temporary_path.open("rb") as validated:
+            with destination.open("xb") as output:
+                output_created = True
+                shutil.copyfileobj(validated, output)
+        result["output_file"] = str(destination)
+        result["repaired"] = result["detected"].copy()
     except EPUBCheckError as exc:
         result.update(reason="epubcheck_failure", detail=str(exc), final_valid=None)
     except BadZipFile as exc:
@@ -97,6 +102,8 @@ def repair_epub(input_path: str, output_path: str) -> dict:
     except (RuntimeError, NotImplementedError) as exc:
         result.update(reason="unsupported_zip", detail=str(exc))
     finally:
+        if output_created and result["output_file"] is None:
+            destination.unlink(missing_ok=True)
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
     return result
