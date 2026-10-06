@@ -1,4 +1,5 @@
-from zipfile import ZIP_STORED, ZipFile
+import struct
+from zipfile import ZIP_STORED, ZipFile, ZipInfo
 
 import pytest
 
@@ -16,14 +17,20 @@ def make_epub(tmp_path):
             "EPUB/chapter.xhtml": '''<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Chapter</title></head><body><h1>Chapter</h1><p>Hello.</p></body></html>''',
         }
         with ZipFile(path, "w") as archive:
-            if mode in ("valid", "incorrect"):
-                content = b"application/epub+zip" if mode == "valid" else b"application/epub+zip\n"
-                archive.writestr("mimetype", content, compress_type=ZIP_STORED)
+            def write_mimetype():
+                entry = ZipInfo("mimetype")
+                entry.compress_type = ZIP_STORED
+                if mode.startswith("extra"):
+                    entry.extra = struct.pack("<HHBI", 0x5455, 5, 1, 1700000000)
+                content = b"application/epub+zip\n" if "incorrect" in mode else b"application/epub+zip"
+                archive.writestr(entry, content)
+
+            if mode in ("valid", "incorrect", "extra", "extra_incorrect"):
+                write_mimetype()
             for name, data in files.items():
                 archive.writestr(name, data)
-            if mode in ("not_first", "incorrect_not_first"):
-                content = b"application/epub+zip" if mode == "not_first" else b"wrong"
-                archive.writestr("mimetype", content, compress_type=ZIP_STORED)
+            if mode in ("not_first", "incorrect_not_first", "extra_not_first", "extra_incorrect_not_first"):
+                write_mimetype()
             for name, data in (extra or {}).items():
                 archive.writestr(name, data)
         return path

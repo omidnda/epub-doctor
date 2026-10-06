@@ -1,17 +1,21 @@
 import shutil
 import tempfile
+from copy import copy
+from lzma import LZMAError
 from pathlib import Path
-from zipfile import BadZipFile, ZIP_STORED, ZipFile
+from zipfile import BadZipFile, LargeZipFile, ZIP_STORED, ZipFile
+from zlib import error as ZlibError
 
 from .diagnoser import diagnose_epub
 from .validator import EPUBCheckError, validate_epub
+from .zip_inspection import UnsafeZipError, inspect_local_headers
 
 
 MIMETYPE = b"application/epub+zip"
 
 
 def repair_epub(input_path: str, output_path: str) -> dict:
-    """Repair PKG-006/PKG-007 mimetype issues; EPUBCheck decides validity.
+    """Repair PKG-005/PKG-006/PKG-007 mimetype issues; EPUBCheck decides validity.
 
     Existing output files are never replaced. `repaired` is populated only
     after a valid recheck and successful publication of the new output.
@@ -37,7 +41,6 @@ def repair_epub(input_path: str, output_path: str) -> dict:
         with ZipFile(source) as archive:
             entries = archive.infolist()
             names = [entry.filename for entry in entries]
-            result["detected"] = diagnose_epub(str(source), original)
             if original["valid"]:
                 result["reason"] = "already_valid"
                 return result
@@ -51,6 +54,7 @@ def repair_epub(input_path: str, output_path: str) -> dict:
             if len(names) != len(set(names)):
                 result["reason"] = "duplicate_zip_entries"
                 return result
+            result["detected"] = diagnose_epub(str(source), original)
             if not result["detected"]:
                 result["reason"] = "no_supported_repair"
                 return result
@@ -65,18 +69,40 @@ def repair_epub(input_path: str, output_path: str) -> dict:
                 result["reason"] = "output_exists"
                 return result
 
+            local_extras = inspect_local_headers(archive)
+            if any(entry.filename != "mimetype"
+                   and (local_extras[entry.filename] or entry.extra) for entry in entries):
+                result["reason"] = "unsafe_metadata_preservation"
+                result["detail"] = "Non-mimetype ZIP extra fields cannot be faithfully rebuilt"
+                return result
+
             stage = "output"
             with tempfile.NamedTemporaryFile(
                 dir=destination.parent, suffix=".epub", delete=False
             ) as temporary:
                 temporary_path = Path(temporary.name)
-            with ZipFile(temporary_path, "w") as rebuilt:
+            with ZipFile(temporary_path, "w", allowZip64=False) as rebuilt:
+                rebuilt.comment = archive.comment
                 rebuilt.writestr("mimetype", MIMETYPE, compress_type=ZIP_STORED)
                 for entry in entries:
                     if entry.filename != "mimetype":
                         # Preserve metadata, bytes, and the original compression method.
-                        rebuilt.writestr(entry, archive.read(entry),
+                        copied = copy(entry)
+                        rebuilt.writestr(copied, archive.read(entry),
                                          compress_type=entry.compress_type)
+                        # zipfile supplies defaults for zero attributes while writing.
+                        copied.external_attr = entry.external_attr
+
+            # Refuse any additional metadata normalization performed by zipfile.
+            with ZipFile(temporary_path) as rebuilt:
+                metadata = ("date_time", "compress_type", "comment", "extra", "internal_attr",
+                            "external_attr", "create_system", "create_version", "extract_version")
+                for entry in entries:
+                    if entry.filename != "mimetype":
+                        copied = rebuilt.getinfo(entry.filename)
+                        if any(getattr(copied, field) != getattr(entry, field) for field in metadata):
+                            raise UnsafeZipError("unsafe_metadata_preservation",
+                                                 f"ZIP metadata changed for {entry.filename}")
 
         stage = "revalidation"
         final = validate_epub(str(temporary_path))
@@ -93,9 +119,13 @@ def repair_epub(input_path: str, output_path: str) -> dict:
                 shutil.copyfileobj(validated, output)
         result["output_file"] = str(destination)
         result["repaired"] = result["detected"].copy()
+    except UnsafeZipError as exc:
+        result.update(reason=exc.reason, detail=str(exc))
+    except LargeZipFile as exc:
+        result.update(reason="unsupported_zip64", detail=str(exc))
     except EPUBCheckError as exc:
         result.update(reason="epubcheck_failure", detail=str(exc), final_valid=None)
-    except BadZipFile as exc:
+    except (BadZipFile, EOFError, UnicodeError, LZMAError, ZlibError) as exc:
         result.update(reason="invalid_zip", detail=str(exc))
     except OSError as exc:
         result.update(reason="output_write_failed" if stage == "output" else "input_read_failed",

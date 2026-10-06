@@ -1,10 +1,12 @@
 from zipfile import ZipFile
 
+from .zip_inspection import inspect_local_headers
+
 
 def diagnose_epub(epub_path: str, validation_result: dict) -> list[str]:
-    """Confirm mimetype diagnoses for reported PKG-006/PKG-007 messages."""
+    """Confirm mimetype diagnoses for reported PKG-005/PKG-006/PKG-007 messages."""
     message_ids = {message["ID"] for message in validation_result["messages"]}
-    if not message_ids.intersection({"PKG-006", "PKG-007"}):
+    if not message_ids.intersection({"PKG-005", "PKG-006", "PKG-007"}):
         return []
 
     diagnoses = []
@@ -20,4 +22,7 @@ def diagnose_epub(epub_path: str, validation_result: dict) -> list[str]:
             # Duplicated, absent, or encrypted entries are not unambiguous repairs.
             if not (entry.flag_bits & 1) and archive.read(entry) != b"application/epub+zip":
                 diagnoses.append("mimetype_incorrect_content")
+        if "PKG-005" in message_ids and entries.count("mimetype") == 1:
+            if inspect_local_headers(archive)["mimetype"]:
+                diagnoses.append("mimetype_has_extra_field")
     return diagnoses
