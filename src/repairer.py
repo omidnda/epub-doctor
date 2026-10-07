@@ -3,9 +3,12 @@ import tempfile
 from copy import copy
 from lzma import LZMAError
 from pathlib import Path
-from zipfile import BadZipFile, LargeZipFile, ZIP_STORED, ZipFile
+from xml.etree import ElementTree
+from zipfile import BadZipFile, LargeZipFile, ZIP_STORED, ZipFile, ZipInfo
 from zlib import error as ZlibError
 
+from . import diagnoser
+from .container_mutation import correct_rootfile_media_type
 from .diagnoser import diagnose_epub
 from .validator import EPUBCheckError, validate_epub
 from .zip_inspection import UnsafeZipError, inspect_local_headers
@@ -14,8 +17,29 @@ from .zip_inspection import UnsafeZipError, inspect_local_headers
 MIMETYPE = b"application/epub+zip"
 
 
+def _build_container_xml(package_path: str) -> bytes:
+    namespace = "urn:oasis:names:tc:opendocument:xmlns:container"
+    media_type = "application/oebps-package+xml"
+    container = ElementTree.Element("container", {"version": "1.0", "xmlns": namespace})
+    rootfiles = ElementTree.SubElement(container, "rootfiles")
+    ElementTree.SubElement(rootfiles, "rootfile", {"full-path": package_path, "media-type": media_type})
+    data = ElementTree.tostring(container, encoding="UTF-8", xml_declaration=True)
+    parsed = ElementTree.fromstring(data)
+    prefix = "{" + namespace + "}"
+    groups = parsed.findall(prefix + "rootfiles")
+    candidates = parsed.findall("./" + prefix + "rootfiles/" + prefix + "rootfile")
+    if (parsed.tag != prefix + "container" or parsed.get("version") != "1.0"
+            or len(groups) != 1 or len(list(parsed.iter(prefix + "rootfiles"))) != 1
+            or len(candidates) != 1
+            or len(list(parsed.iter(prefix + "rootfile"))) != 1
+            or candidates[0].get("full-path") != package_path
+            or candidates[0].get("media-type") != media_type):
+        raise UnsafeZipError("unsafe_container_creation", "Generated container semantics differ")
+    return data
+
+
 def repair_epub(input_path: str, output_path: str) -> dict:
-    """Repair PKG-005/PKG-006/PKG-007 mimetype issues; EPUBCheck decides validity.
+    """Repair confirmed mimetype/container/manifest issues; EPUBCheck decides validity.
 
     Existing output files are never replaced. `repaired` is populated only
     after a valid recheck and successful publication of the new output.
@@ -76,6 +100,30 @@ def repair_epub(input_path: str, output_path: str) -> dict:
                 result["detail"] = "Non-mimetype ZIP extra fields cannot be faithfully rebuilt"
                 return result
 
+            repair_mimetype = any(item.startswith("mimetype_") for item in result["detected"])
+            replacements = {}
+            new_container = None
+            if "manifest_missing_required_property" in result["detected"]:
+                replacement = diagnoser._manifest_property_replacement(archive, original)
+                if replacement is None:
+                    raise UnsafeZipError("unsafe_manifest_property_repair", "OPF-014 evidence was not reconfirmed")
+                package_path, changed = replacement
+                replacements[package_path] = changed
+            if "container_xml_missing" in result["detected"]:
+                package_path = diagnoser._find_unique_package_path(archive, original)
+                if package_path is None or result["detected"] != ["container_xml_missing"]:
+                    raise UnsafeZipError("unsafe_container_creation", "Unique package evidence was not confirmed")
+                new_container = _build_container_xml(package_path)
+            if "rootfile_incorrect_media_type" in result["detected"]:
+                if not repair_mimetype and (not names or names[0] != "mimetype"
+                        or archive.getinfo("mimetype").compress_type != ZIP_STORED
+                        or local_extras["mimetype"] or archive.getinfo("mimetype").extra):
+                    result["reason"] = "unsupported_mimetype_structure"
+                    return result
+                replacements["META-INF/container.xml"] = correct_rootfile_media_type(
+                    archive.read("META-INF/container.xml")
+                )
+
             stage = "output"
             with tempfile.NamedTemporaryFile(
                 dir=destination.parent, suffix=".epub", delete=False
@@ -83,22 +131,30 @@ def repair_epub(input_path: str, output_path: str) -> dict:
                 temporary_path = Path(temporary.name)
             with ZipFile(temporary_path, "w", allowZip64=False) as rebuilt:
                 rebuilt.comment = archive.comment
-                rebuilt.writestr("mimetype", MIMETYPE, compress_type=ZIP_STORED)
+                if repair_mimetype:
+                    rebuilt.writestr("mimetype", MIMETYPE, compress_type=ZIP_STORED)
                 for entry in entries:
-                    if entry.filename != "mimetype":
+                    if entry.filename != "mimetype" or not repair_mimetype:
                         # Preserve metadata, bytes, and the original compression method.
                         copied = copy(entry)
-                        rebuilt.writestr(copied, archive.read(entry),
+                        data = (replacements[entry.filename] if entry.filename in replacements
+                                else archive.read(entry))
+                        rebuilt.writestr(copied, data,
                                          compress_type=entry.compress_type)
                         # zipfile supplies defaults for zero attributes while writing.
                         copied.external_attr = entry.external_attr
+                        if entry.filename == "mimetype" and new_container is not None:
+                            container_entry = ZipInfo("META-INF/container.xml", (2020, 1, 1, 0, 0, 0))
+                            container_entry.create_system = 3
+                            container_entry.external_attr = 0o600 << 16
+                            rebuilt.writestr(container_entry, new_container, compress_type=ZIP_STORED)
 
             # Refuse any additional metadata normalization performed by zipfile.
             with ZipFile(temporary_path) as rebuilt:
                 metadata = ("date_time", "compress_type", "comment", "extra", "internal_attr",
                             "external_attr", "create_system", "create_version", "extract_version")
                 for entry in entries:
-                    if entry.filename != "mimetype":
+                    if entry.filename != "mimetype" or not repair_mimetype:
                         copied = rebuilt.getinfo(entry.filename)
                         if any(getattr(copied, field) != getattr(entry, field) for field in metadata):
                             raise UnsafeZipError("unsafe_metadata_preservation",

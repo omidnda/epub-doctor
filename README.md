@@ -5,13 +5,60 @@ validation authority; Python diagnoses its reports rather than validating EPUB
 content independently. Requires Python 3.10+ and Java on PATH.
 
 ```python
-from src.repairer import repair_epub
+from src.service import inspect_epub, repair_epub_file
 
-result = repair_epub("book.epub", "book-repaired.epub")
+inspection = inspect_epub("book.epub")
+result = repair_epub_file("book.epub", "book-repaired.epub")
 print(result)
 ```
 
-Flow: validate original → diagnose PKG-005/PKG-006/PKG-007 → inspect ZIP safety → rebuild
+## Internal service API
+
+`inspect_epub(path: str) -> dict` runs the existing validator and conservative
+diagnoser without modifying the input or creating an output EPUB. Its exact
+top-level schema is:
+
+```text
+{
+    "valid": bool,
+    "repairable": bool,
+    "safe_repairs": list[str],
+    "fatal_count": int,
+    "error_count": int,
+    "warning_count": int,
+    "messages": list[dict],
+    "publication": dict
+}
+```
+
+`safe_repairs` contains the existing diagnosis names; `repairable` is exactly
+`len(safe_repairs) > 0`. It describes confirmed supported diagnoses, not a
+guarantee of successful repair: the repair pipeline still applies all safety
+refusals and requires a valid recheck. Counts, messages and publication metadata
+come from EPUBCheck unchanged; nested report fields follow EPUBCheck 5.4.0.
+Validation uses a temporary JSON report that is cleaned up, never an output EPUB.
+
+Inspection returns no partial result on failure. Existing exceptions propagate:
+`FileNotFoundError`/other `OSError` for input access, `EPUBCheckError` for missing
+Java/JAR or execution/report failures, and existing ZIP/decompression exceptions
+or `UnsafeZipError` for diagnosis failures. A report that an EPUB is invalid
+is normal inspection data, rather than an execution failure. Unsupported or
+ambiguous cases that the diagnoser already declines yield an empty diagnosis list.
+
+`repair_epub_file(input_path: str, output_path: str) -> dict` delegates directly
+to `repair_epub`, preserving all result fields, reason codes, optional `detail`,
+and safety checks. Expected operational failures remain structured repair
+results as described below. The service adds no exception catches; unexpected
+programming errors propagate from both functions.
+
+The CLI calls this service and keeps its existing arguments, printed result,
+and exit behavior:
+
+```sh
+python3 -m src.main input.epub output.epub
+```
+
+Flow: validate original → diagnose supported issues → inspect ZIP safety → rebuild
 into a temporary archive → revalidate → publish a separate output.
 The original and any existing output are never overwritten. ZIP entries are
 copied directly without extracting paths to disk. After successful revalidation,
@@ -19,9 +66,9 @@ output is created exclusively (`xb`) and copied from the validated archive.
 This prevents overwrites without requiring hard links. The copy is not atomically
 visible; a failed copy is removed and returns `output_write_failed`.
 
-Only `mimetype_missing`, `mimetype_not_first` (PKG-006),
+Supported mimetype diagnoses are `mimetype_missing`, `mimetype_not_first` (PKG-006),
 `mimetype_incorrect_content` (PKG-007), and `mimetype_has_extra_field` (PKG-005)
-are supported. Content diagnosis requires
+for the corresponding PKG reports. Content diagnosis requires
 an EPUBCheck PKG-007 message and exactly one readable, unencrypted root mimetype
 entry whose bytes differ from the required value. The same rebuild handles
 these diagnoses, including combined mimetype errors. The rebuilt
@@ -84,3 +131,257 @@ these failures into structured results.
 Tests generate small EPUB fixtures in temporary directories, including real
 EPUBCheck validation and repair/revalidation of PKG-005, both PKG-006 causes, and PKG-007. They
 require the bundled JAR and Java; no Downloads files or network fixtures.
+
+## Missing-container diagnosis and repair (RSC-002)
+
+`container_xml_missing` diagnoses a missing container in a conservative subset.
+It requires an actual RSC-002 report, no PKG-005/006/007 report,
+an absent `META-INF/container.xml`, unique ZIP names, and the existing trustworthy
+local/central ZIP header inspection. Signed/encrypted publications or entries
+are refused. Exactly one first, stored, unencrypted `mimetype` entry must contain
+`application/epub+zip` exactly and have no local or central extra fields.
+
+Package discovery deliberately considers only filenames ending in `.opf`
+(case insensitive). Each candidate must have a safe, literal ZIP path, and its
+XML root must be exactly `{http://www.idpf.org/2007/opf}package`. Version strings
+are not used as a gate: EPUB2 and EPUB3 package roots are both recognized.
+Zero or multiple package documents are refused. Malformed XML and non-package
+roots do not count; DTDs, unsafe paths, unreadable candidates, and oversized
+candidates prevent a positive diagnosis, including when another package exists.
+
+The parser limit is 8 MiB per XML; discovery additionally refuses more than 64
+candidates or over 32 MiB total declared candidate bytes. Unrelated payloads are
+not read or parsed. This intentionally does not discover packages with arbitrary
+extensions or claim that other EPUB errors are absent. Existing ZIP64,
+descriptor, unsupported flag/compression, and inconsistent-header refusals apply.
+Repository-owned [official fixture copies](tests/fixtures/rsc002/README.md)
+exercise EPUBCheck 5.4.0 with missing-container EPUB2/EPUB3 and a DOCX archive.
+
+Diagnosis and repair share `_find_unique_package_path`, which returns the exact
+proven ZIP entry name or `None`; the public diagnosis API remains `list[str]`.
+After diagnosis, repair rechecks the same evidence against the open source ZIP.
+It builds UTF-8 container XML using ElementTree attribute escaping (no raw path
+interpolation), then reparses and checks the OCF namespace, version, unique
+rootfiles/rootfile, exact full-path, and standard package media type.
+
+RSC-002 repair adds only `META-INF/container.xml`, immediately after the existing
+mimetype entry. Its ZIP timestamp is fixed to 2020-01-01, its compression is
+ZIP_STORED, and its creator system/permissions are fixed to Unix/0600. Existing
+entries retain their order, data, compression methods, and the metadata covered
+by the current policy; mimetype is copied without regeneration. Non-mimetype
+extra fields and any additional metadata normalization remain refusals. RSC-002
+is not combined with mimetype repairs. Output is published exclusively only
+after successful EPUBCheck revalidation; failures retain remaining messages and
+publish no output. Compressed streams and transport metadata may be regenerated
+as described by the existing ZIP rebuild policy.
+
+## Local MCP server
+
+The adapter uses the official Python MCP SDK **2.3.0** (`mcp>=2.3,<3`),
+`mcp.server.MCPServer`, `@mcp.tool()`, and `run(transport="stdio")`.
+The SDK was checked against its installed API and
+[official documentation](https://py.sdk.modelcontextprotocol.io/).
+Only these two tools are exposed:
+
+| Tool | Required input | Structured output |
+| --- | --- | --- |
+| `inspect_epub` | `path: str` | The exact eight-field inspection schema above |
+| `repair_epub` | `input_path: str`, `output_path: str` | `original_valid: bool \| None`, `detected: list[str]`, `repaired: list[str]`, `final_valid: bool \| None`, `output_file: str \| None`, `remaining_messages: list[dict]`, `reason: str \| None`; optional `detail: str` |
+
+Results are returned unchanged from the service in MCP `structured_content`,
+with equivalent JSON text in `content`. The SDK publishes string input schemas
+and object output schemas; the precise result fields are the service contract.
+Inspection's `repairable` still means only that `safe_repairs` is non-empty.
+A successful validated repair requires the service to publish an output; no
+adapter logic decides whether repair succeeded.
+
+**Local paths only:** files must be accessible to the MCP process under its
+normal filesystem permissions. Absolute paths are recommended; relative paths
+resolve against the server's working directory, not the client's. Arguments
+are passed verbatim to the service. URL-like strings are treated as filesystem
+paths, never downloaded or decoded. There are no uploads, base64 transfer,
+cloud storage, file endpoints, or network listeners. All existing no-overwrite
+and conservative EPUB/ZIP safety checks remain in the engine.
+
+Expected inspection exceptions become SDK `ToolError` responses (`is_error=True`,
+no structured result) with distinguishable labels: `input_not_found`,
+`input_read_failed`, `epubcheck_failure`, `invalid_zip`, `unsupported_zip`,
+`unsupported_zip64`, or the existing `UnsafeZipError.reason`. An invalid EPUB
+that EPUBCheck can report remains normal inspection data (`valid=False`), not
+an execution error. Diagnosis failures that the existing diagnoser declines
+still return its empty diagnosis list.
+
+Repair refusals and operational failures already represented by the service
+remain normal structured MCP results (`is_error=False`), including their
+`reason` and optional `detail`; callers must inspect those fields. For example,
+a missing repair input has `reason="input_read_failed"`, EPUBCheck execution
+failure has `reason="epubcheck_failure"`, corrupt ZIP repair has
+`reason="invalid_zip"`, and an existing destination has `reason="output_exists"`.
+The adapter catches no broad `Exception` or generic `RuntimeError`. Unexpected
+errors propagate to the SDK, which logs a traceback and returns a sanitized
+failed tool call rather than disguising them as domain refusals.
+
+Run from the repository root (Python 3.10+ and Java on PATH):
+
+```sh
+.venv/bin/python -m pip install 'mcp>=2.3,<3'
+.venv/bin/python -m src.mcp_server
+```
+
+The process waits for MCP messages on stdin; stdout carries protocol data.
+A local MCP host can launch it using this configuration (adjust absolute paths
+for your checkout; `cwd` is supported by the SDK client and many local hosts):
+
+```json
+{
+  "mcpServers": {
+    "epub-doctor": {
+      "command": "/home/omid/Desktop/projects/epub-doctor/.venv/bin/python",
+      "args": ["-m", "src.mcp_server"],
+      "cwd": "/home/omid/Desktop/projects/epub-doctor"
+    }
+  }
+}
+```
+
+For hosts without a `cwd` setting, set `env.PYTHONPATH` to the repository root
+and use absolute EPUB paths.
+
+### Manual stdio smoke test
+
+Run this from the repository root after installing the SDK. It starts the server
+as a local subprocess through the official SDK client, lists both tools,
+inspects the known RSC-002 fixture, repairs to a temporary output, re-inspects,
+and confirms an existing-output refusal. It leaves the fixture unchanged and
+cleans up its output; no deployment or Inspector installation is needed.
+
+```sh
+.venv/bin/python - <<'PY'
+import asyncio
+import sys
+import tempfile
+from pathlib import Path
+from mcp import Client, StdioServerParameters
+
+async def smoke():
+    root = Path.cwd()
+    source = root / "tests/fixtures/rsc002/epub3-missing-container.epub"
+    before = source.read_bytes()
+    params = StdioServerParameters(
+        command=sys.executable, args=["-m", "src.mcp_server"], cwd=str(root)
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        output = str(Path(directory) / "repaired.epub")
+        async with Client(params, read_timeout_seconds=60) as client:
+            names = {tool.name for tool in (await client.list_tools()).tools}
+            assert names == {"inspect_epub", "repair_epub"}
+            inspected = await client.call_tool("inspect_epub", {"path": str(source)})
+            assert not inspected.is_error
+            assert inspected.structured_content["safe_repairs"] == ["container_xml_missing"]
+            assert inspected.structured_content["repairable"] is True
+            assert not Path(output).exists()
+            repaired = await client.call_tool("repair_epub", {
+                "input_path": str(source), "output_path": output
+            })
+            assert not repaired.is_error
+            assert repaired.structured_content["final_valid"] is True
+            assert repaired.structured_content["output_file"] == output
+            assert repaired.structured_content["repaired"] == ["container_xml_missing"]
+            checked = await client.call_tool("inspect_epub", {"path": output})
+            assert not checked.is_error and checked.structured_content["valid"] is True
+            refused = await client.call_tool("repair_epub", {
+                "input_path": str(source), "output_path": output
+            })
+            assert not refused.is_error
+            assert refused.structured_content["reason"] == "output_exists"
+            assert source.read_bytes() == before
+            print("MCP stdio smoke test passed")
+
+asyncio.run(smoke())
+PY
+```
+
+Focused MCP tests: `.venv/bin/python -m pytest -q tests/test_mcp_server.py`.
+Full regression suite: `.venv/bin/python -m pytest -q`.
+
+## Required manifest properties (OPF-014)
+
+`manifest_missing_required_property` repairs only the exact English EPUBCheck
+5.4.0 message `The property "<property>" should be declared in the OPF file.`
+for `scripted`, `svg`, or `remote-resources`. `switch`, future properties,
+malformed messages, missing/unsafe locations, and reports with omitted
+`additionalLocations` are refused. EPUBCheck remains the sole content detector:
+EPUB Doctor does not analyze JavaScript, forms, SVG, CSS, fonts or audio.
+
+Diagnosis and repair share `_manifest_property_replacement`, including the
+complete mutation proof. Package resolution reuses the existing single-rootfile
+OCF logic from RSC-003 and the bounded XML reader. This subset requires an
+existing unique standard-media-type rootfile, an EPUB3 `version="3.0"` OPF,
+UTF-8 XML (optional BOM), no DTD or `xml:base`, exactly one direct manifest,
+and unique nonempty manifest IDs. XML is bounded at 8 MiB; Expat additionally
+refuses documents reaching 100,000 recorded events before a start element.
+
+Report locations must be exact safe archive resource names. Manifest `href`s
+are resolved relative to the package directory using URI components and a path
+segment stack: `.` is removed and `..` may ascend within the archive but never
+above its root. Zero/multiple matches, missing resources, directory resources,
+and already-declared required tokens refuse the whole OPF-014 set. Unrelated
+HTTP(S) manifest entries remain remote and cannot match local locations.
+Percent-encoded hrefs, absolute local paths, query/fragment suffixes, empty path
+segments, control characters, backslashes and other schemes are outside this
+conservative subset; an unsupported href anywhere prevents a mapping proof.
+No URI decoding, content detection or additional package discovery is performed.
+
+Every reported message and every location must pass before any mutation is
+returned. Repeated evidence is coalesced. Multiple missing tokens for the same
+item are appended once in deterministic lexical order, preserving existing
+property tokens and their original spelling/whitespace. Expat locates each
+actual manifest-item start tag, and a quoted-attribute scanner identifies its
+byte offsets. Mutation inserts only ASCII property tokens into that attribute
+value or adds a `properties` attribute to that exact tag. It does not serialize
+the document, change namespaces, or rewrite comments, quotes or unrelated bytes.
+A second parse verifies the entire semantic event stream against the original
+with only the proven property-attribute additions, and verifies token uniqueness.
+
+OPF-014 diagnosis additionally requires a canonical mimetype and all existing
+ZIP layout/metadata checks, including no non-mimetype extra fields. This phase
+does not combine OPF-014 with damaged mimetype or missing/incorrect containers.
+The existing rebuild/revalidation/exclusive-output pipeline publishes output
+only when EPUBCheck reports it valid. Service/MCP schemas and tools are unchanged.
+As before, validity permits warnings, and `remaining_messages` preserves them.
+
+Unsupported/unsafe evidence normally yields no OPF-014 diagnosis and
+`reason="no_supported_repair"` if no other supported diagnosis exists. Existing
+early refusals such as `signatures_or_encryption`, `duplicate_zip_entries`,
+`output_exists` and `output_is_input` remain unchanged. If previously confirmed
+OPF evidence cannot be reconfirmed, or XML mutation fails proof, the structured
+repair refusal uses `unsafe_manifest_property_repair` with `detail`.
+Failed revalidation returns `revalidation_failed` and publishes no output.
+
+[Official fixture copies](tests/fixtures/opf014/README.md) cover all ten requested
+cases and the excluded `switch` case. Nine supported fixtures revalidate with
+zero errors/warnings. With bundled EPUBCheck 5.4.0, the inline-CSS remote-font
+fixture becomes valid but emits OPF-018 after its reported property is added;
+tests explicitly check and retain that warning. No checker behavior or warning
+policy is changed. The JavaScript fixture provides a clean independent E2E.
+
+```sh
+.venv/bin/python -m pytest -q tests/test_opf014.py
+```
+
+To reproduce independent before/after EPUBCheck verification for the clean
+JavaScript fixture, run from the repository root (the first checker invocation
+normally exits 1 because OPF-014 is present):
+
+```sh
+opf014_evidence_dir=$(mktemp -d)
+java -jar vendor/epubcheck-5.4.0/epubcheck.jar tests/fixtures/opf014/package-manifest-prop-scripted-undeclared-javascript-error.epub --json "$opf014_evidence_dir/before.json"
+.venv/bin/python -m src.main tests/fixtures/opf014/package-manifest-prop-scripted-undeclared-javascript-error.epub "$opf014_evidence_dir/repaired.epub"
+java -jar vendor/epubcheck-5.4.0/epubcheck.jar "$opf014_evidence_dir/repaired.epub" --json "$opf014_evidence_dir/after.json"
+```
+
+The first report has OPF-014 at `EPUB/content_001.xhtml`. The service result has
+`detected`/`repaired=["manifest_missing_required_property"]`, `final_valid=True`,
+and no remaining messages. The independent output check has zero fatals,
+errors and warnings. Only the content item's `properties="scripted"` attribute
+is added in `EPUB/package.opf`; the existing navigation property is unchanged.
