@@ -4,6 +4,12 @@ Small Python engine for deterministic repairs. Bundled EPUBCheck 5.4.0 is the
 validation authority; Python diagnoses its reports rather than validating EPUB
 content independently. Requires Python 3.10+ and Java on PATH.
 
+The ChatGPT adapter accepts uploaded-file references and supports development
+Streamable HTTP. **Repaired-file delivery to ChatGPT is not implemented**:
+validated temporary outputs are deleted, and the response explicitly reports
+that no downloadable file is available. This is not yet a complete “Fix this
+EPUB and download the result” integration.
+
 ```python
 from src.service import inspect_epub, repair_epub_file
 
@@ -385,3 +391,158 @@ The first report has OPF-014 at `EPUB/content_001.xhtml`. The service result has
 and no remaining messages. The independent output check has zero fatals,
 errors and warnings. Only the content item's `properties="scripted"` attribute
 is added in `EPUB/package.opf`; the existing navigation property is unchanged.
+
+## ChatGPT file-input MCP adapter (development)
+
+`src/chatgpt_mcp_server.py` is a separate adapter. The original
+`python -m src.mcp_server` still exposes local path-based tools over stdio.
+Core/service files, ZIP checks, six repair families and validation semantics
+are unchanged. No dependency was added: the installed official MCP SDK 2.3.0
+provides `MCPServer`, tool metadata and Streamable HTTP; downloads use stdlib.
+
+The new adapter exposes exactly `inspect_epub(file)` and `repair_epub(file)`.
+Both input schemas contain one object named `file`:
+
+```json
+{
+  "download_url": "https://public-download-host.example/signed-object",
+  "file_id": "file-reference-id",
+  "mime_type": "application/epub+zip",
+  "file_name": "book.epub"
+}
+```
+
+This is a schema example, not a working download URL. Only `download_url` and
+`file_id` are required. Both optional fields are declared, as required by the
+[official ChatGPT file input contract](https://developers.openai.com/plugins/reference).
+Each tool publishes `_meta: {"openai/fileParams": ["file"]}`. `OpenAIFile` is
+the exact documented schema expressed as a TypedDict; the installed SDK has
+no built-in class with that name. Neither tool accepts local paths.
+
+Downloads accept credential-free HTTPS URLs on port 443 only. Signed query
+parameters are supported, but full URLs/tokens are not included in adapter
+errors or logs. DNS is resolved once; every returned address must be public,
+excluding private, loopback, link-local, multicast, reserved and IPv6 transition
+addresses. The verified IP is pinned to the connection while the original
+hostname is retained for Host, TLS certificate verification and SNI. Environment
+proxy settings are not used. All redirects and HTTP content compression are
+refused. Uploaded filenames and MIME types are untrusted hints; EPUBCheck
+determines validity, and filenames never determine filesystem paths.
+
+`MAX_INPUT_BYTES` is **20 MiB (20,971,520 bytes)**. Oversized Content-Length is
+refused before reading, and streaming byte accounting enforces the same limit
+when the header is missing or misleading. `DOWNLOAD_TIMEOUT_SECONDS=15` applies
+to socket connection/read operations. `DOWNLOAD_BUDGET_SECONDS=60` is checked
+between reads; it is not a hard deadline for OS DNS resolution or a blocking
+operation. These limits concern downloaded input bytes, not expanded ZIP size
+or EPUBCheck runtime; the existing core safety policy remains intact.
+
+Each call owns a private `TemporaryDirectory` with controlled `input.epub` and,
+for repair only, `repaired.epub`. Context-manager cleanup removes partial input
+and output on success, refusal and exceptions; cleanup failure is reported
+rather than silently ignored. Inspection creates no output EPUB.
+
+Inspection returns the exact eight service fields above, unchanged. Repair
+returns this envelope:
+
+```text
+{
+  "repair": {
+    "original_valid": bool | None,
+    "detected": list[str],
+    "repaired": list[str],
+    "final_valid": bool | None,
+    "output_file": None,
+    "remaining_messages": list[dict],
+    "reason": str | None,
+    "detail": str                 # optional, preserved when present
+  },
+  "file_output": {
+    "status": "unavailable",
+    "delivered": False,
+    "detail": str
+  }
+}
+```
+
+The service result itself is unchanged. Its internal temporary output path is
+projected to `None` in the remote response because that file is deleted before
+returning. All other repair fields, including optional `detail`, retain their
+service values. `repaired`/`final_valid` describe validated temporary repair,
+not successful delivery. Refusal or failed revalidation is a normal structured
+tool result and never delivers invalid output.
+
+**Native output limitation:** the inspected SDK and official documentation did
+not establish a server API to register generated EPUB bytes with ChatGPT and
+return a supported downloadable file reference. Generic MCP ResourceLinks do
+not prove ChatGPT delivery support. No resource link, filesystem path, localhost
+URL, data URL or base64 payload is advertised as a downloadable file. Completing
+delivery requires that official registration capability and its documented
+file-result contract. This limitation applies even to a successful temporary
+repair; the temporary result is deleted.
+
+Expected malformed arguments become SDK tool errors. Transfer failures use
+safe `FileDownloadError` messages translated to `ToolError`, including
+`invalid_file_reference`, `invalid_download_url`, `unsafe_download_host`,
+`file_too_large`, `download_timeout`, `download_redirect_refused`,
+`download_encoding_refused`, `download_failed` and `temporary_workspace_failed`.
+Inspection reuses the local adapter's existing service-error translation:
+missing input, EPUBCheck execution/report failure and invalid/unsafe ZIP failures
+remain distinct. Repair preserves the service's structured failures/refusals.
+No broad exception handler hides programming errors; the official SDK handles
+uncaught tool exceptions at its boundary.
+
+Run from the repository root:
+
+```sh
+# Existing local path tools:
+.venv/bin/python -m src.mcp_server
+# File-reference tools, stdio:
+.venv/bin/python -m src.chatgpt_mcp_server
+# File-reference tools, development HTTP endpoint http://127.0.0.1:8000/mcp:
+.venv/bin/python -m src.chatgpt_mcp_server --transport streamable-http --host 127.0.0.1 --port 8000
+```
+
+The HTTP entry point uses the SDK's `/mcp`, stateless Streamable HTTP and JSON
+responses. DNS-rebinding protection remains enabled. For a development public
+HTTPS endpoint, add its exact Host/Origin with `--allowed-host dev.example.org`
+and `--allowed-origin https://dev.example.org` (include a nondefault port if
+present). This server implements no authentication and binds loopback by
+default. No deployment or live ChatGPT connection is included. ChatGPT needs
+[public HTTPS or the supported secure MCP tunnel](https://developers.openai.com/plugins/deploy/connect-chatgpt);
+a localhost endpoint is only for local MCP clients. Official custom-server
+[documentation permits development with no authentication](https://developers.openai.com/api/docs/guides/custom-mcp-server).
+
+For a local HTTP initialization/discovery smoke test, leave the server running
+in one terminal and run this in another (requires no EPUB download):
+
+```sh
+.venv/bin/python - <<'PY'
+import asyncio
+from mcp import Client
+
+async def smoke():
+    async with Client("http://127.0.0.1:8000/mcp") as client:
+        tools = (await client.list_tools()).tools
+        assert {tool.name for tool in tools} == {"inspect_epub", "repair_epub"}
+        assert all(tool.meta["openai/fileParams"] == ["file"] for tool in tools)
+        print("HTTP initialization and tool discovery passed")
+
+asyncio.run(smoke())
+PY
+```
+
+For a reproducible fixture integration smoke test without external network or
+ChatGPT, use the repository-owned OPF-014 JavaScript fixture:
+
+```sh
+.venv/bin/python -m pytest -q tests/test_chatgpt_mcp_server.py -k 'real_ or http_initialization or stdio_discovery'
+.venv/bin/python -m pytest -q tests/test_chatgpt_files.py tests/test_chatgpt_mcp_server.py
+.venv/bin/python -m pytest -q
+```
+
+The integration tests supply fixture bytes through a fake HTTPS response, invoke
+the real service via the SDK, verify successful revalidation and the generated
+OPF property, and assert input/output cleanup with delivery explicitly false.
+Additional SDK HTTP tests initialize `/mcp`, discover both tools, invoke file
+inspection and check Host rejection. Unit downloads never contact real network.
