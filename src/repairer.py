@@ -39,7 +39,7 @@ def _build_container_xml(package_path: str) -> bytes:
 
 
 def repair_epub(input_path: str, output_path: str) -> dict:
-    """Repair confirmed mimetype/container/manifest issues; EPUBCheck decides validity.
+    """Repair confirmed mimetype/container/manifest/NCX issues; EPUBCheck decides validity.
 
     Existing output files are never replaced. `repaired` is populated only
     after a valid recheck and successful publication of the new output.
@@ -79,6 +79,11 @@ def repair_epub(input_path: str, output_path: str) -> dict:
                 result["reason"] = "duplicate_zip_entries"
                 return result
             result["detected"] = diagnose_epub(str(source), original)
+            ncx_replacement = None
+            if any(message["ID"] == "NCX-001" for message in original["messages"]):
+                # Reconfirm full proof and retain precise refusal reasons even
+                # when diagnosis intentionally exposes no safe repair family.
+                ncx_replacement = diagnoser._ncx_identifier_replacement(archive, original)
             if not result["detected"]:
                 result["reason"] = "no_supported_repair"
                 return result
@@ -102,6 +107,11 @@ def repair_epub(input_path: str, output_path: str) -> dict:
 
             repair_mimetype = any(item.startswith("mimetype_") for item in result["detected"])
             replacements = {}
+            if "ncx_identifier_mismatch" in result["detected"]:
+                if ncx_replacement is None:
+                    raise UnsafeZipError("ncx_evidence_missing", "NCX-001 evidence was not reconfirmed")
+                ncx_path, changed = ncx_replacement
+                replacements[ncx_path] = changed
             new_container = None
             if "manifest_missing_required_property" in result["detected"]:
                 replacement = diagnoser._manifest_property_replacement(archive, original)

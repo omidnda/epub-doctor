@@ -397,11 +397,76 @@ and no remaining messages. The independent output check has zero fatals,
 errors and warnings. Only the content item's `properties="scripted"` attribute
 is added in `EPUB/package.opf`; the existing navigation property is unchanged.
 
+## NCX identifier mismatch (NCX-001)
+
+The seventh safe family is `ncx_identifier_mismatch`. [EPUBCheck's message reference](https://w3c.github.io/epubcheck/docs/messages/)
+defines NCX-001 as a mismatch between the NCX and OPF identifiers. The bundled
+5.4.0 checker emits an ERROR for the repository's real positive fixtures.
+
+Diagnosis requires actual NCX-001 evidence plus independent proof:
+
+- One existing OCF rootfile selects an OPF 2.0/3.0 package, without xml:base.
+- `package/@unique-identifier` resolves to exactly one direct metadata
+  `dc:identifier`, with a globally unique matching ID. Multiple distinct
+  identifiers are supported; only the explicitly referenced one is used.
+- The canonical identifier is nonempty plain XML text, without leading/trailing
+  whitespace, controls or child elements. No identifier-format guess, UUID
+  generation, ISBN inference or normalization is performed. Known validator
+  evidence of an invalid/unresolved identifier (OPF-030/048/085) refuses repair.
+- Exactly one NCX manifest item is selected explicitly by `spine/@toc`.
+  Its safe local href resolves to one archive member without aliases, and every
+  NCX-001 report location matches that member. URI mapping reuses the existing
+  conservative manifest resolver; no percent decoding or remote target fetch.
+- Exactly one correctly namespaced direct `ncx/head/meta` has `name="dtb:uid"`
+  and an existing nonempty literal `content` value that differs from the OPF
+  identifier. Missing elements/attributes are never created.
+
+Expat identifies the exact attribute byte span; mutation replaces only that
+value with the safely XML-escaped canonical identifier. A second parse verifies
+the full semantic event stream with only that attribute changed. NCX whitespace,
+quotes, comments, namespaces, unrelated XML and other ZIP members remain intact.
+The existing rebuild, ZIP metadata preservation, real EPUBCheck revalidation
+and exclusive-output publication pipeline is reused unchanged.
+
+Refusals preserve `repaired=[]`, `output_file=None` and the original input.
+Reasons include `ncx_unique_identifier_missing`, `ncx_identifier_ambiguous`,
+`ncx_identifier_invalid`, `ncx_package_ambiguous`, `ncx_package_unsupported`,
+`ncx_target_ambiguous`, `ncx_target_unreadable`, `ncx_evidence_ambiguous`,
+`unsafe_ncx_archive`, `unsafe_ncx_identifier_proof` and
+`unsafe_ncx_identifier_mutation`; `detail` identifies the failed proof.
+Inspection exposes the family only after complete proof. If NCX-001 was never
+reported, existing `already_valid` / `no_supported_repair` behavior applies.
+Failed final validation still returns `revalidation_failed` and no output.
+
+Intentional limits: one rootfile/publication, one declared NCX, explicit
+spine/@toc, canonical mimetype and existing preservable ZIP structure with no
+extra fields. This subset does not combine NCX repair with damaged mimetype or
+container repairs. XML reads are bounded to 8 MiB each; NCX mutation supports
+UTF-8 (including BOM). Element starts are refused at 100,000 accumulated semantic
+events or 128 levels of nesting. DTDs and custom entity declarations,
+non-UTF-8 NCX, xml:base, ambiguous/aliased targets and non-ASCII reference IDs are
+refused. Canonical identifier text itself may be Unicode; it is copied without
+inventing a new value. Other errors are never repaired by this family and must
+still pass final validation. Service/MCP contracts and temporary delivery are
+unchanged; no new dependency or RSC-008 repair was added.
+
+[Small reproducible fixtures](tests/fixtures/ncx001/README.md) include real
+NCX-001 mismatch cases and conservative refusals:
+
+```sh
+.venv/bin/python -m pytest -q tests/test_ncx001.py
+.venv/bin/python -m src.main tests/fixtures/ncx001/identifier-mismatch.epub repaired-ncx.epub
+java -jar vendor/epubcheck-5.4.0/epubcheck.jar repaired-ncx.epub --json /tmp/ncx-after.json
+```
+
+The output pathname must not already exist. Positive EPUB2 fixtures and a
+generated EPUB3 test independently validate with zero fatal/error after repair.
+
 ## ChatGPT file-input MCP adapter (development)
 
 `src/chatgpt_mcp_server.py` is a separate adapter. The original
 `python -m src.mcp_server` still exposes local path-based tools over stdio.
-Core/service files, ZIP checks, six repair families and validation semantics
+Core/service files, ZIP checks, seven repair families and validation semantics
 are unchanged. No dependency was added: the installed official MCP SDK 2.3.0
 provides `MCPServer`, tool metadata and Streamable HTTP; downloads use stdlib.
 

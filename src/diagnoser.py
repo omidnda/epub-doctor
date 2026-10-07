@@ -1,10 +1,13 @@
 from lzma import LZMAError
+import re
 from xml.etree import ElementTree
 from zipfile import BadZipFile, ZIP_STORED, ZipFile
 from zlib import error as ZlibError
 
 from .manifest_mutation import add_required_manifest_properties
-from .zip_inspection import inspect_local_headers
+from .manifest_mutation import _resolve_href
+from .ncx_mutation import correct_ncx_identifier
+from .zip_inspection import UnsafeZipError, inspect_local_headers
 
 
 class _NoDTDTreeBuilder(ElementTree.TreeBuilder):
@@ -174,14 +177,100 @@ def _manifest_property_replacement(archive: ZipFile, validation_result: dict):
         return None
 
 
+def _ncx_identifier_replacement(archive: ZipFile, validation_result: dict):
+    """Prove a single-publication NCX mismatch or raise a precise safe refusal."""
+    def refuse(reason, detail):
+        raise UnsafeZipError(reason, detail)
+
+    reports = [message for message in validation_result['messages'] if message['ID'] == 'NCX-001']
+    if not reports:
+        refuse('ncx_evidence_missing', 'No EPUBCheck NCX-001 evidence')
+    if any(message['ID'] in {'OPF-030', 'OPF-048', 'OPF-085'} for message in validation_result['messages']):
+        refuse('ncx_identifier_invalid', 'EPUBCheck reports an invalid or unresolved package identifier')
+    try:
+        entries, names = archive.infolist(), archive.namelist()
+        publication = validation_result.get('publication', {})
+        if (len(names) != len(set(names)) or names.count('mimetype') != 1
+                or publication.get('hasSignatures') or publication.get('hasEncryption')
+                or 'META-INF/signatures.xml' in names or 'META-INF/encryption.xml' in names
+                or any(entry.flag_bits & 1 for entry in entries)):
+            refuse('unsafe_ncx_archive', 'Duplicate, encrypted, signed or non-OCF archive')
+        extras = inspect_local_headers(archive)
+        mimetype = archive.getinfo('mimetype')
+        if (names[0] != 'mimetype' or mimetype.compress_type != ZIP_STORED
+                or mimetype.file_size != len(b'application/epub+zip')
+                or archive.read(mimetype) != b'application/epub+zip'
+                or any(extras[entry.filename] or entry.extra for entry in entries)):
+            refuse('unsafe_ncx_archive', 'NCX repair requires canonical mimetype and preservable ZIP metadata')
+        rootfile = _container_rootfile(archive, reject_xml_base=True)
+        if rootfile is None or rootfile.get('media-type') != 'application/oebps-package+xml':
+            refuse('ncx_package_ambiguous', 'No unique supported OCF package rootfile')
+        package_path = rootfile.get('full-path')
+        if any(127 <= ord(char) <= 159 for char in package_path):
+            refuse('ncx_package_unsupported', 'Control characters in package path')
+        package = _read_xml(archive, package_path)
+        opf, dc = '{http://www.idpf.org/2007/opf}', '{http://purl.org/dc/elements/1.1/}'
+        if (package is None or package.tag != opf + 'package' or package.get('version') not in ('2.0', '3.0')
+                or any('{http://www.w3.org/XML/1998/namespace}base' in item.attrib for item in package.iter())):
+            refuse('ncx_package_unsupported', 'Unsupported package, xml:base or unreadable OPF')
+        reference = package.get('unique-identifier')
+        if not reference:
+            refuse('ncx_unique_identifier_missing', 'package/@unique-identifier is missing or empty')
+        if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9._-]*', reference):
+            refuse('ncx_identifier_invalid', 'Identifier reference is outside the supported NCName subset')
+        metadata = package.findall(opf + 'metadata')
+        if len(metadata) != 1 or len(list(package.iter(opf + 'metadata'))) != 1:
+            refuse('ncx_identifier_ambiguous', 'No unique package metadata')
+        identifiers = [item for item in metadata[0].findall(dc + 'identifier') if item.get('id') == reference]
+        matches = [item for item in package.iter() if item.get('id') == reference]
+        if len(identifiers) != 1 or len(matches) != 1:
+            refuse('ncx_identifier_ambiguous', 'unique-identifier does not resolve to exactly one direct dc:identifier')
+        identifier = identifiers[0]
+        canonical = identifier.text or ''
+        if (list(identifier) or not canonical or canonical != canonical.strip()
+                or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in canonical)):
+            refuse('ncx_identifier_invalid', 'Canonical identifier must be nonempty plain text without edge whitespace/controls')
+        manifests, spines = package.findall(opf + 'manifest'), package.findall(opf + 'spine')
+        if (len(manifests) != 1 or len(spines) != 1
+                or len(list(package.iter(opf + 'manifest'))) != 1
+                or len(list(package.iter(opf + 'spine'))) != 1):
+            refuse('ncx_target_ambiguous', 'No unique manifest/spine')
+        items = list(manifests[0])
+        ids = [item.get('id') for item in items]
+        if (any(item.tag != opf + 'item' for item in items) or not all(ids) or len(set(ids)) != len(ids)
+                or len(list(package.iter(opf + 'item'))) != len(items)):
+            refuse('ncx_target_ambiguous', 'Unsupported manifest or duplicate/missing item IDs')
+        targets = [item for item in items if item.get('media-type') == 'application/x-dtbncx+xml']
+        if len(targets) != 1 or spines[0].get('toc') != targets[0].get('id'):
+            refuse('ncx_target_ambiguous', 'Require one NCX manifest item explicitly referenced by spine/@toc')
+        paths = [_resolve_href(package_path, item.get('href', '')) for item in items]
+        target = _resolve_href(package_path, targets[0].get('href', ''))
+        if target is None or paths.count(target) != 1 or not _safe_package_path(target):
+            refuse('ncx_target_ambiguous', 'NCX target is remote, unsafe or aliased')
+        if any(not isinstance(message.get('locations'), list) or not message['locations']
+               or any(not isinstance(location, dict) or location.get('path') != target for location in message['locations'])
+               or message.get('additionalLocations', 0) != 0 for message in reports):
+            refuse('ncx_evidence_ambiguous', 'Every NCX-001 report must identify the same proven NCX path')
+        data = _read_xml_bytes(archive, target)
+        if data is None:
+            refuse('ncx_target_unreadable', 'NCX missing, duplicated, encrypted or oversized')
+        return target, correct_ncx_identifier(data, canonical)
+    except (ElementTree.ParseError, ValueError, LookupError, BadZipFile, OSError,
+            EOFError, RuntimeError, NotImplementedError, LZMAError, ZlibError) as exc:
+        if isinstance(exc, UnsafeZipError):
+            raise
+        raise UnsafeZipError('unsafe_ncx_identifier_proof', str(exc)) from exc
+
+
 def diagnose_epub(epub_path: str, validation_result: dict) -> list[str]:
-    """Confirm reported mimetype, container and conservative OPF-014 subsets."""
+    """Confirm reported mimetype, container and conservative OPF-014/NCX-001 subsets."""
     message_ids = {message["ID"] for message in validation_result["messages"]}
     pkg_reported = message_ids.intersection({"PKG-005", "PKG-006", "PKG-007"})
     rootfile_reported = "RSC-003" in message_ids and not message_ids.intersection({"OPF-016", "OPF-017"})
     container_reported = "RSC-002" in message_ids and not pkg_reported
     manifest_reported = "OPF-014" in message_ids
-    if not pkg_reported and not rootfile_reported and not container_reported and not manifest_reported:
+    ncx_reported = "NCX-001" in message_ids
+    if not any((pkg_reported, rootfile_reported, container_reported, manifest_reported, ncx_reported)):
         return []
 
     diagnoses = []
@@ -212,4 +301,10 @@ def diagnose_epub(epub_path: str, validation_result: dict) -> list[str]:
             diagnoses.append("container_xml_missing")
         if manifest_reported and _manifest_property_replacement(archive, validation_result) is not None:
             diagnoses.append("manifest_missing_required_property")
+        if ncx_reported:
+            try:
+                _ncx_identifier_replacement(archive, validation_result)
+                diagnoses.append("ncx_identifier_mismatch")
+            except UnsafeZipError:
+                pass
     return diagnoses
