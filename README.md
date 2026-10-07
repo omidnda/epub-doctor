@@ -4,11 +4,16 @@ Small Python engine for deterministic repairs. Bundled EPUBCheck 5.4.0 is the
 validation authority; Python diagnoses its reports rather than validating EPUB
 content independently. Requires Python 3.10+ and Java on PATH.
 
-The ChatGPT adapter accepts uploaded-file references and supports development
-Streamable HTTP. **Repaired-file delivery to ChatGPT is not implemented**:
-validated temporary outputs are deleted, and the response explicitly reports
-that no downloadable file is available. This is not yet a complete “Fix this
-EPUB and download the result” integration.
+The ChatGPT adapter accepts uploaded-file references over Streamable HTTP.
+With an explicit public HTTPS origin, successful validated repairs return an
+external temporary download link, available for 15 minutes. This is not a native
+ChatGPT attachment. See [delivery, security, retention and exact live-test commands](docs/temporary-epub-delivery.md).
+Authentication/privacy/plugin-review decisions remain before public production.
+
+An isolated [external download-link investigation and live PoC](docs/external-download-investigation.md)
+proved clickable-link/download behavior in the user's live ChatGPT test. It
+remains a separate development utility serving fixed public text; production
+delivery does not depend on the PoC.
 
 ```python
 from src.service import inspect_epub, repair_epub_file
@@ -458,9 +463,12 @@ returns this envelope:
     "detail": str                 # optional, preserved when present
   },
   "file_output": {
-    "status": "unavailable",
-    "delivered": False,
-    "detail": str
+    "status": "available" | "unavailable" | "failed",
+    "delivered": bool,
+    "detail": str,               # optional; disabled/refused/failed delivery
+    "download_url": str,         # success only: configured HTTPS capability URL
+    "expires_in_seconds": int,   # success only: 900
+    "file_name": str             # success only: sanitized display name
   }
 }
 ```
@@ -468,18 +476,20 @@ returns this envelope:
 The service result itself is unchanged. Its internal temporary output path is
 projected to `None` in the remote response because that file is deleted before
 returning. All other repair fields, including optional `detail`, retain their
-service values. `repaired`/`final_valid` describe validated temporary repair,
-not successful delivery. Refusal or failed revalidation is a normal structured
-tool result and never delivers invalid output.
+service values. `repaired`/`final_valid` describe validated repair; only
+`file_output.delivered=True` indicates publication of a downloadable object.
+Refusal or failed revalidation remains a normal structured tool result and never
+publishes output. Publication failure retains repair semantics but returns
+`status=failed`, `delivered=False`, without a URL. Without `--public-origin`,
+delivery remains explicitly unavailable and workspace output is deleted.
 
 **Native output limitation:** the inspected SDK and official documentation did
 not establish a server API to register generated EPUB bytes with ChatGPT and
 return a supported downloadable file reference. Generic MCP ResourceLinks do
 not prove ChatGPT delivery support. No resource link, filesystem path, localhost
-URL, data URL or base64 payload is advertised as a downloadable file. Completing
-delivery requires that official registration capability and its documented
-file-result contract. This limitation applies even to a successful temporary
-repair; the temporary result is deleted.
+URL, data URL or base64 payload is advertised as a downloadable file. Configured
+delivery instead returns an ordinary external HTTPS capability link to the
+temporary validated copy; it does not require or claim native registration.
 
 Expected malformed arguments become SDK tool errors. Transfer failures use
 safe `FileDownloadError` messages translated to `ToolError`, including
@@ -501,14 +511,18 @@ Run from the repository root:
 .venv/bin/python -m src.chatgpt_mcp_server
 # File-reference tools, development HTTP endpoint http://127.0.0.1:8000/mcp:
 .venv/bin/python -m src.chatgpt_mcp_server --transport streamable-http --host 127.0.0.1 --port 8000
+# Enable real temporary output delivery: use your actual public HTTPS hostname.
+.venv/bin/python -m src.chatgpt_mcp_server --transport streamable-http \
+  --public-origin https://YOUR-ACTUAL-HOST.trycloudflare.com
 ```
 
 The HTTP entry point uses the SDK's `/mcp`, stateless Streamable HTTP and JSON
 responses. DNS-rebinding protection remains enabled. For a development public
 HTTPS endpoint, add its exact Host/Origin with `--allowed-host dev.example.org`
-and `--allowed-origin https://dev.example.org` (include a nondefault port if
-present). This server implements no authentication and binds loopback by
-default. No deployment or live ChatGPT connection is included. ChatGPT needs
+and `--allowed-origin https://dev.example.org` when using the older inspection-only
+HTTP configuration. `--public-origin` automatically allowlists its exact Host /
+Origin and enables downloads; links require HTTPS port 443. This server implements
+no authentication and binds loopback by default. No deployment is included. ChatGPT needs
 [public HTTPS or the supported secure MCP tunnel](https://developers.openai.com/plugins/deploy/connect-chatgpt);
 a localhost endpoint is only for local MCP clients. Official custom-server
 [documentation permits development with no authentication](https://developers.openai.com/api/docs/guides/custom-mcp-server).
@@ -543,6 +557,8 @@ ChatGPT, use the repository-owned OPF-014 JavaScript fixture:
 
 The integration tests supply fixture bytes through a fake HTTPS response, invoke
 the real service via the SDK, verify successful revalidation and the generated
-OPF property, and assert input/output cleanup with delivery explicitly false.
+OPF property, and assert input/output workspace cleanup. Unconfigured adapter
+tests retain delivery=false; configured [delivery tests](tests/test_chatgpt_download_delivery.py)
+download exact published bytes and independently validate them with EPUBCheck.
 Additional SDK HTTP tests initialize `/mcp`, discover both tools, invoke file
 inspection and check Host rejection. Unit downloads never contact real network.
