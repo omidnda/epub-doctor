@@ -130,10 +130,16 @@ def test_real_checker_unsupported_fixtures_never_mutate(fixture, tmp_path):
     # EPUBCheck accepts a missing dtb:uid in this EPUB2 shape. That is still
     # not NCX-001 mismatch evidence and must never trigger UID construction.
     assert initial['valid'] is (fixture == 'missing-uid')
-    assert diagnoser.diagnose_epub(str(source), initial) == []
+    # The unresolved OPF is now independently repairable by OPF-030, while
+    # NCX repair still needs NCX-001 evidence and must not construct identifiers.
+    expected = ['package_unique_identifier_unresolved'] if fixture == 'unresolved-identifier' else []
+    assert diagnoser.diagnose_epub(str(source), initial) == expected
     output = tmp_path / 'out.epub'
     result = service.repair_epub_file(str(source), str(output))
     assert result['reason'] and result['repaired'] == [] and result['output_file'] is None
+    if fixture == 'unresolved-identifier':
+        assert result['reason'] == 'revalidation_failed'
+        assert [message['ID'] for message in result['remaining_messages']] == ['NCX-001']
     assert not output.exists() and source.read_bytes() == before
 
 

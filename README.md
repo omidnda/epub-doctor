@@ -717,3 +717,85 @@ java -jar vendor/epubcheck-5.4.0/epubcheck.jar /tmp/rsc008-repaired.epub
 ```
 
 Use a new, absent output path; existing outputs are never overwritten.
+
+## Unresolved package identifier reference (OPF-030)
+
+The ninth safe family is `package_unique_identifier_unresolved`. [EPUBCheck's
+message reference](https://w3c.github.io/epubcheck/docs/messages/) describes
+OPF-030 as a unique-identifier that was not found. Real bundled 5.4.0 fixtures
+confirm that an unresolved existing reference produces OPF-030; EPUB3 additionally
+reports the exact schema RSC-005 about that reference not resolving to a
+dc:identifier. Missing/empty references also produce OPF-030, along with OPF-048
+and schema errors, and intentionally remain unsupported.
+
+Proof requires one existing unambiguous package rootfile, an EPUB2/EPUB3 UTF-8
+OPF, one direct metadata element and exactly one direct dc:identifier. Its
+existing unqualified id must be a nonempty ASCII NCName and unique across all
+unqualified/XML IDs in the package. Its content must be nonempty plain text,
+without edge whitespace, controls, child elements, comments or processing
+instructions. No identifier filtering or UUID/ISBN/scheme preference is used:
+multiple identifiers always refuse, including partially invalid alternatives.
+
+The existing package unique-identifier must itself be a nonempty ASCII NCName,
+and its current value must name no existing package element. Every complete
+OPF-030 report must have the exact current-reference message and locations in
+that proven package. Absent/mismatched/incomplete evidence refuses. A reference
+that already names an element (including a wrong-kind element) is outside this
+absent-ID subset. Candidate values are neither generated nor normalized; the
+[EPUB identifier requirement](https://www.w3.org/TR/epub-33/#sec-opf-dcidentifier)
+is honored by reusing only the sole existing identifier.
+
+Only the existing attribute value is replaced. Parser-proven byte offsets reuse
+the engine's existing attribute scanner; quotes, whitespace, comments, namespaces,
+metadata, manifest, spine, existing IDs and identifier content remain unchanged.
+Full before/after XML event streams must differ only in this one root attribute.
+DTD/entity declarations, xml:base, unsupported encoding, malformed/oversized XML,
+depth above 128 and excessive parser events refuse. Reads retain the 8 MiB bound.
+Archive proofs retain canonical mimetype, unique safe members, signature/encryption
+refusals and local/central header/metadata checks; extra fields refuse.
+
+The exact proven EPUB3 identifier-reference RSC-005 is the only recognized direct
+schema companion; mismatched reference/package evidence refuses. Generic RSC-005
+errors are not fixed, suppressed or reinterpreted, and unrelated errors prevent
+publication when final EPUBCheck still reports them. OPF-048 and invalid UUID
+metadata (OPF-085) cannot authorize identifier creation or normalization.
+
+The pipeline plans from the original report and revalidates once; it is not an
+iterative fixer. Concurrent OPF-014/RSC-008 edits of the same OPF are refused.
+Existing NCX repair already refuses initial OPF-030 evidence; that policy is
+unchanged, and initial OPF-030 plus NCX-001 is not combined. OPF-030 repair never
+edits NCX. Real fixtures prove that an initially unreported NCX mismatch appears
+after fixing the reference and then fails revalidation, without publishing any
+output or starting a second repair pass. A matching NCX remains byte-for-byte
+unchanged and the corrected EPUB validates successfully.
+
+Failures include `opf030_evidence_ambiguous`, `opf030_package_ambiguous`,
+`opf030_unique_identifier_missing`, `opf030_identifier_missing`,
+`opf030_identifier_ambiguous`, `opf030_identifier_id_invalid`,
+`opf030_identifier_value_invalid`, `opf030_reference_already_exists`,
+`opf030_conflicting_repair`, `unsafe_opf030_archive` and `unsafe_opf030_mutation`.
+Existing archive-wide refusal precedence and result schemas remain unchanged.
+The normal rebuild, real EPUBCheck and exclusive output creation are reused;
+failed validation keeps `repaired=[]`, `output_file=None` and publishes nothing.
+Original EPUBs are never mutated or overwritten. Service, MCP, temporary-download
+delivery and dependencies are unchanged.
+
+Identifier validation can be deferred until its reference resolves: a real
+invalid-UUID fixture initially has only OPF-030 and the reference RSC-005, then
+produces OPF-085 as a warning after retargeting. For this family, that explicit
+invalid-identifier evidence fails the proof and blocks publication. No UUID
+parser, generation or normalization is added. `final_valid` still preserves
+the real validator's True value for a warnings-only report, while `repaired=[]`,
+`output_file=None` and `reason=opf030_identifier_value_invalid` show refusal.
+The general warnings policy and all other repair families are unchanged.
+
+See [fixture evidence and reproduction](tests/fixtures/opf030/README.md) and
+[focused tests](tests/test_opf030.py).
+
+```sh
+.venv/bin/python -m pytest -q tests/test_opf030.py
+python3 -m src.main tests/fixtures/opf030/unresolved.epub /tmp/opf030-repaired.epub
+java -jar vendor/epubcheck-5.4.0/epubcheck.jar /tmp/opf030-repaired.epub
+```
+
+Choose an absent output path; existing files are not replaced.

@@ -87,6 +87,9 @@ def repair_epub(input_path: str, output_path: str) -> dict:
             resource_replacement = None
             if any(message["ID"] == "RSC-008" for message in original["messages"]):
                 resource_replacement = diagnoser._referenced_resource_replacement(archive, original)
+            identifier_replacement = None
+            if any(message["ID"] == "OPF-030" for message in original["messages"]):
+                identifier_replacement = diagnoser._unique_identifier_replacement(archive, original)
             if not result["detected"]:
                 result["reason"] = "no_supported_repair"
                 return result
@@ -110,6 +113,11 @@ def repair_epub(input_path: str, output_path: str) -> dict:
 
             repair_mimetype = any(item.startswith("mimetype_") for item in result["detected"])
             replacements = {}
+            if "package_unique_identifier_unresolved" in result["detected"]:
+                if identifier_replacement is None:
+                    raise UnsafeZipError("opf030_evidence_ambiguous", "OPF-030 proof was not reconfirmed")
+                package_path, changed = identifier_replacement
+                replacements[package_path] = changed
             if "manifest_missing_referenced_resource" in result["detected"]:
                 if resource_replacement is None:
                     raise UnsafeZipError("rsc008_evidence_ambiguous", "RSC-008 evidence was not reconfirmed")
@@ -181,6 +189,14 @@ def repair_epub(input_path: str, output_path: str) -> dict:
         stage = "revalidation"
         final = validate_epub(str(temporary_path))
         result.update(final_valid=final["valid"], remaining_messages=final["messages"])
+        if ("package_unique_identifier_unresolved" in result["detected"]
+                and any(message["ID"] == "OPF-085" for message in final["messages"])):
+            # Identifier checks can be deferred until the reference resolves.
+            # A UUID warning invalidates this repair's identifier proof even
+            # when the general validator's warnings policy reports valid=True.
+            result.update(reason="opf030_identifier_value_invalid",
+                          detail="Final EPUBCheck reports an invalid UUID for the existing identifier")
+            return result
         if not final["valid"]:
             result["reason"] = "revalidation_failed"
             return result
