@@ -84,6 +84,9 @@ def repair_epub(input_path: str, output_path: str) -> dict:
                 # Reconfirm full proof and retain precise refusal reasons even
                 # when diagnosis intentionally exposes no safe repair family.
                 ncx_replacement = diagnoser._ncx_identifier_replacement(archive, original)
+            resource_replacement = None
+            if any(message["ID"] == "RSC-008" for message in original["messages"]):
+                resource_replacement = diagnoser._referenced_resource_replacement(archive, original)
             if not result["detected"]:
                 result["reason"] = "no_supported_repair"
                 return result
@@ -107,6 +110,11 @@ def repair_epub(input_path: str, output_path: str) -> dict:
 
             repair_mimetype = any(item.startswith("mimetype_") for item in result["detected"])
             replacements = {}
+            if "manifest_missing_referenced_resource" in result["detected"]:
+                if resource_replacement is None:
+                    raise UnsafeZipError("rsc008_evidence_ambiguous", "RSC-008 evidence was not reconfirmed")
+                package_path, changed = resource_replacement
+                replacements[package_path] = changed
             if "ncx_identifier_mismatch" in result["detected"]:
                 if ncx_replacement is None:
                     raise UnsafeZipError("ncx_evidence_missing", "NCX-001 evidence was not reconfirmed")

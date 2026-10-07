@@ -466,7 +466,7 @@ generated EPUB3 test independently validate with zero fatal/error after repair.
 
 `src/chatgpt_mcp_server.py` is a separate adapter. The original
 `python -m src.mcp_server` still exposes local path-based tools over stdio.
-Core/service files, ZIP checks, seven repair families and validation semantics
+Core/service files, ZIP checks, repair families and validation semantics
 are unchanged. No dependency was added: the installed official MCP SDK 2.3.0
 provides `MCPServer`, tool metadata and Streamable HTTP; downloads use stdlib.
 
@@ -627,3 +627,93 @@ tests retain delivery=false; configured [delivery tests](tests/test_chatgpt_down
 download exact published bytes and independently validate them with EPUBCheck.
 Additional SDK HTTP tests initialize `/mcp`, discover both tools, invoke file
 inspection and check Host rejection. Unit downloads never contact real network.
+
+## Missing referenced manifest declarations (RSC-008)
+
+The eighth safe family is `manifest_missing_referenced_resource`. It adds only
+manifest declarations for resources explicitly reported by bundled EPUBCheck
+5.4.0, never unreported files discovered by scanning the ZIP. The checker message
+names the target member; its location names the **referring document**. Both are
+required, and the existing declared XHTML/SVG/CSS referrer must independently
+contain a supported literal reference to that exact target.
+
+This subset requires a canonical, unsigned, unencrypted OCF archive with unique
+members, safe paths, no ZIP extra fields and one existing supported rootfile.
+The EPUB3 OPF must be UTF-8, DTD-free, without xml:base, and have a unique nonempty
+manifest. Existing manifest hrefs must resolve uniquely through the engine's
+existing resolver. An already-declared target, ambiguous publication, missing
+resource, unsupported URI, mismatched evidence or unprovable type refuses the
+entire operation. No existing IDs or publication identifiers are changed.
+
+The explicit media-type allowlist follows [EPUB core media types](https://www.w3.org/TR/epub-33/#sec-core-media-types):
+
+| Extensions | Declared media type | Independent content check |
+| --- | --- | --- |
+| png | image/png | PNG signature, IHDR header and nonzero dimensions |
+| jpg, jpeg | image/jpeg | JPEG start/end signatures |
+| gif | image/gif | GIF87a/89a header, dimensions and trailer |
+| svg | image/svg+xml | UTF-8 XML with SVG namespace/root |
+| css | text/css | Nonempty UTF-8 text, no NUL or HTML/XML prefix |
+| xhtml, html | application/xhtml+xml | UTF-8 XML with XHTML namespace/root |
+| ttf | font/ttf | TrueType sfnt header and bounded table directory |
+| otf | font/otf | OTTO header and bounded table directory |
+| woff, woff2 | font/woff, font/woff2 | Matching signature, supported flavor and length/header |
+
+These format checks prove the narrow declaration mapping, not complete resource
+validity. Real final EPUBCheck is still mandatory. HTML syntax without the XHTML
+XML namespace is unsupported. New script/event-handler/nav/embedded-SVG content
+requiring properties is refused; simultaneous OPF-014 edits are refused rather
+than combine two mutations of the same OPF. Linked XHTML is refused because
+EPUBCheck additionally requires a spine item; embedded XHTML via iframe/object
+can be declared without changing spine. No navigation, content, CSS, resource,
+reading order, properties or metadata repair is performed by this family.
+
+Targets are deduplicated and sorted by exact archive path. Internal NCName-safe
+IDs `epub-doctor-resource-N` skip all existing unqualified/XML IDs deterministically.
+Relative hrefs are generated from the OPF directory and reconfirmed with the
+existing resolver. All new item bytes are inserted immediately before the
+parser-proven manifest closing tag, reusing its namespace prefix. The complete
+before/after XML event streams must differ only by the planned item events.
+Existing OPF bytes, metadata, spine, comments, item declarations and unrelated
+ZIP members/metadata remain intact. Any failed target refuses all additions.
+
+Only exact OPF-003 messages identifying one of these fully proven targets, with
+locations in the same target/package, are accepted as declaration companions.
+Unrecognized/unrelated OPF-003 evidence refuses. Other errors are not suppressed:
+the unchanged rebuild/revalidation/exclusive-publication pipeline publishes only
+a final valid EPUB, with `repaired` empty on failure and no invalid output.
+Service, MCP, temporary download delivery and result schemas are unchanged.
+
+Intentional limits: EPUB3 only; canonical ASCII target/package/referrer paths;
+no schemes, percent encoding, query, fragment evidence, xml:base, HTML base,
+manifest/reference aliases, DTDs or non-UTF-8 XML. Referrers support explicit
+XHTML resource attributes, SVG image hrefs and literal CSS url() tokens. CSS
+escapes/imports and inline style references are outside this subset. Up to 128
+complete RSC-008 reports, 8 MiB per inspected member and 32 MiB total proof bytes
+are supported. Unknown type/magic and unsupported properties/structure refuse;
+final errors prevent publication. Warnings retain the existing validator policy.
+No network access or new dependency is used.
+
+Precise failures use `rsc008_evidence_ambiguous`, `rsc008_resource_missing`,
+`rsc008_resource_ambiguous`, `rsc008_resource_already_declared`,
+`rsc008_media_type_unsupported`, `rsc008_package_ambiguous`,
+`rsc008_remote_resource`, `rsc008_properties_unsupported`,
+`rsc008_resource_requires_spine`, `rsc008_companion_unsupported`,
+`unsafe_rsc008_archive` and `unsafe_rsc008_manifest_mutation`, with detail.
+Existing archive-wide refusals such as `duplicate_zip_entries` and
+`signatures_or_encryption` retain precedence in repair results.
+
+[Reproducible fixtures and real-checker evidence](tests/fixtures/rsc008/README.md)
+cover PNG, JPEG, multiple images, SVG, CSS and embedded XHTML. Linked XHTML and
+scripted XHTML are conservative refusals. A real unrelated XML error exercises
+failed revalidation. Font mappings have unit/header and CSS-referrer proof tests;
+no real-font end-to-end claim is made. This checker did not emit OPF-003 alongside
+the real positive fixtures; its companion tests are explicitly synthetic.
+
+```sh
+.venv/bin/python -m pytest -q tests/test_rsc008.py
+python3 -m src.main tests/fixtures/rsc008/multiple.epub /tmp/rsc008-repaired.epub
+java -jar vendor/epubcheck-5.4.0/epubcheck.jar /tmp/rsc008-repaired.epub
+```
+
+Use a new, absent output path; existing outputs are never overwritten.

@@ -149,7 +149,9 @@ def test_no_ncx001_never_changes_matching_epub(tmp_path):
 def test_mismatch_without_ncx001_is_not_detected(build, tmp_path, monkeypatch):
     source = build()
     before = source.read_bytes()
-    validation = dict(valid=False, messages=[{'ID': 'RSC-008'}], publication={})
+    # RSC-008 now has its own proven repair subset. Keep this NCX isolation
+    # test on an unsupported code without changing its refusal assertions.
+    validation = dict(valid=False, messages=[{'ID': 'RSC-007'}], publication={})
     stub(monkeypatch, validation)
     assert diagnoser.diagnose_epub(str(source), validation) == []
     output = tmp_path / 'out.epub'

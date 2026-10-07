@@ -7,6 +7,7 @@ from zlib import error as ZlibError
 from .manifest_mutation import add_required_manifest_properties
 from .manifest_mutation import _resolve_href
 from .ncx_mutation import correct_ncx_identifier
+from .resource_manifest_mutation import add_referenced_resources
 from .zip_inspection import UnsafeZipError, inspect_local_headers
 
 
@@ -262,15 +263,52 @@ def _ncx_identifier_replacement(archive: ZipFile, validation_result: dict):
         raise UnsafeZipError('unsafe_ncx_identifier_proof', str(exc)) from exc
 
 
+def _referenced_resource_replacement(archive: ZipFile, validation_result: dict):
+    """Share all-or-nothing RSC-008 proof between inspection and repair."""
+    try:
+        entries, names = archive.infolist(), archive.namelist()
+        publication = validation_result.get('publication', {})
+        if (len(names) != len(set(names)) or names.count('mimetype') != 1
+                or publication.get('hasSignatures') or publication.get('hasEncryption')
+                or 'META-INF/signatures.xml' in names or 'META-INF/encryption.xml' in names
+                or any(entry.flag_bits & 1 for entry in entries)
+                or any(not _safe_package_path(entry.filename.rstrip('/'))
+                       or any(127 <= ord(char) <= 159 for char in entry.filename) for entry in entries)):
+            raise UnsafeZipError('unsafe_rsc008_archive', 'Duplicate, signed, encrypted or non-OCF archive')
+        extras = inspect_local_headers(archive)
+        mimetype = archive.getinfo('mimetype')
+        if (names[0] != 'mimetype' or mimetype.compress_type != ZIP_STORED
+                or mimetype.file_size != len(b'application/epub+zip')
+                or archive.read(mimetype) != b'application/epub+zip'
+                or any(extras[entry.filename] or entry.extra for entry in entries)):
+            raise UnsafeZipError('unsafe_rsc008_archive', 'Require canonical mimetype and preservable ZIP metadata')
+        rootfile = _container_rootfile(archive, reject_xml_base=True)
+        if rootfile is None or rootfile.get('media-type') != 'application/oebps-package+xml':
+            raise UnsafeZipError('rsc008_package_ambiguous', 'No unique supported OCF package rootfile')
+        package_path = rootfile.get('full-path')
+        data = _read_xml_bytes(archive, package_path)
+        if data is None:
+            raise UnsafeZipError('rsc008_package_ambiguous', 'Unreadable or oversized package')
+        changed = add_referenced_resources(data, package_path, validation_result['messages'], names,
+                                           lambda path: _read_xml_bytes(archive, path))
+        return package_path, changed
+    except (ElementTree.ParseError, ValueError, LookupError, BadZipFile, OSError,
+            EOFError, RuntimeError, NotImplementedError, LZMAError, ZlibError) as exc:
+        if isinstance(exc, UnsafeZipError):
+            raise
+        raise UnsafeZipError('unsafe_rsc008_archive', str(exc)) from exc
+
+
 def diagnose_epub(epub_path: str, validation_result: dict) -> list[str]:
-    """Confirm reported mimetype, container and conservative OPF-014/NCX-001 subsets."""
+    """Confirm reported mimetype, container and OPF-014/NCX-001/RSC-008 subsets."""
     message_ids = {message["ID"] for message in validation_result["messages"]}
     pkg_reported = message_ids.intersection({"PKG-005", "PKG-006", "PKG-007"})
     rootfile_reported = "RSC-003" in message_ids and not message_ids.intersection({"OPF-016", "OPF-017"})
     container_reported = "RSC-002" in message_ids and not pkg_reported
     manifest_reported = "OPF-014" in message_ids
     ncx_reported = "NCX-001" in message_ids
-    if not any((pkg_reported, rootfile_reported, container_reported, manifest_reported, ncx_reported)):
+    resources_reported = "RSC-008" in message_ids
+    if not any((pkg_reported, rootfile_reported, container_reported, manifest_reported, ncx_reported, resources_reported)):
         return []
 
     diagnoses = []
@@ -305,6 +343,12 @@ def diagnose_epub(epub_path: str, validation_result: dict) -> list[str]:
             try:
                 _ncx_identifier_replacement(archive, validation_result)
                 diagnoses.append("ncx_identifier_mismatch")
+            except UnsafeZipError:
+                pass
+        if resources_reported:
+            try:
+                _referenced_resource_replacement(archive, validation_result)
+                diagnoses.append("manifest_missing_referenced_resource")
             except UnsafeZipError:
                 pass
     return diagnoses
