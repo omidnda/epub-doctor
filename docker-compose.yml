@@ -1,0 +1,75 @@
+services:
+  app:
+    build: .
+    init: true
+    restart: unless-stopped
+    command:
+      - --transport
+      - streamable-http
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --public-origin
+      - ${EPUB_DOCTOR_PUBLIC_ORIGIN:?Set your real HTTPS origin in .env}
+      - --download-directory
+      - /data/downloads
+    environment:
+      EPUB_DOCTOR_MAX_CONCURRENT_OPERATIONS: "1"
+      EPUB_DOCTOR_TELEMETRY_ENABLED: ${EPUB_DOCTOR_TELEMETRY_ENABLED:-0}
+      EPUB_DOCTOR_TELEMETRY_PATH: /data/telemetry/events.jsonl
+      EPUB_DOCTOR_TELEMETRY_MAX_BYTES: ${EPUB_DOCTOR_TELEMETRY_MAX_BYTES:-10485760}
+      EPUB_DOCTOR_TELEMETRY_BACKUP_COUNT: ${EPUB_DOCTOR_TELEMETRY_BACKUP_COUNT:-5}
+    volumes:
+      - app-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=128m,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 1g
+    memswap_limit: 1g
+    cpus: 1.0
+    pids_limit: 128
+    stop_grace_period: 150s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  nginx:
+    image: nginx:stable-alpine
+    user: "101:101"
+    restart: unless-stopped
+    entrypoint: ["nginx", "-g", "daemon off;"]
+    ports:
+      - "127.0.0.1:${EPUB_DOCTOR_HTTP_PORT:-8080}:8080"
+    volumes:
+      - ./deploy/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 64m
+    memswap_limit: 64m
+    cpus: 0.5
+    pids_limit: 32
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  app-data:

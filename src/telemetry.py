@@ -73,13 +73,28 @@ def versions():
 def write_event(event):
     """Storage boundary: replace this writer to use another backend.
 
-    Lock covers open/write/close across all threads in this process. No cross-process
+    Lock covers rotation/open/write/close across all threads in this process. No cross-process
     guarantee or durability guarantee is made. Newly created files are owner-only.
     """
     line = json.dumps(event, ensure_ascii=True, allow_nan=False) + '\n'
     path = Path(os.environ['EPUB_DOCTOR_TELEMETRY_PATH'])
+    max_bytes = int(os.environ.get('EPUB_DOCTOR_TELEMETRY_MAX_BYTES', 10 * 1024 * 1024))
+    backups = int(os.environ.get('EPUB_DOCTOR_TELEMETRY_BACKUP_COUNT', 5))
+    if max_bytes <= 0 or backups <= 0:
+        raise ValueError('Telemetry rotation limits must be positive integers')
+    line_bytes = len(line.encode('utf-8'))
+    if line_bytes > max_bytes:
+        raise ValueError('Telemetry event exceeds the configured file limit')
     with _WRITE_LOCK:
         path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.stat().st_size + line_bytes > max_bytes:
+            # Preserve complete JSONL records; .1 is the most recent archive.
+            path.with_name(path.name + f'.{backups}').unlink(missing_ok=True)
+            for index in range(backups - 1, 0, -1):
+                source = path.with_name(path.name + f'.{index}')
+                if source.exists():
+                    source.replace(path.with_name(path.name + f'.{index + 1}'))
+            path.replace(path.with_name(path.name + '.1'))
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         with os.fdopen(fd, 'a', encoding='utf-8') as output:
             output.write(line)

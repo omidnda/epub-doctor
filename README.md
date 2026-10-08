@@ -9,6 +9,9 @@ With an explicit public HTTPS origin, successful validated repairs return an
 external temporary download link, available for 15 minutes. This is not a native
 ChatGPT attachment. See [delivery, security, retention and exact live-test commands](docs/temporary-epub-delivery.md).
 Authentication/privacy/plugin-review decisions remain before public production.
+See the [public privacy-policy draft](PRIVACY.md) and
+[publication notes](docs/privacy-publication.md) for verified file/telemetry
+handling and deployment details still to complete.
 
 An isolated [external download-link investigation and live PoC](docs/external-download-investigation.md)
 proved clickable-link/download behavior in the user's live ChatGPT test. It
@@ -587,7 +590,7 @@ HTTPS endpoint, add its exact Host/Origin with `--allowed-host dev.example.org`
 and `--allowed-origin https://dev.example.org` when using the older inspection-only
 HTTP configuration. `--public-origin` automatically allowlists its exact Host /
 Origin and enables downloads; links require HTTPS port 443. This server implements
-no authentication and binds loopback by default. No deployment is included. ChatGPT needs
+no authentication and binds loopback by default. A Docker Compose deployment is described below. ChatGPT needs
 [public HTTPS or the supported secure MCP tunnel](https://developers.openai.com/plugins/deploy/connect-chatgpt);
 a localhost endpoint is only for local MCP clients. Official custom-server
 [documentation permits development with no authentication](https://developers.openai.com/api/docs/guides/custom-mcp-server).
@@ -879,10 +882,173 @@ original service exceptions are re-raised unchanged, with no exception text in
 events. Failed collection is silent and can lose events. The writer is isolated
 in `src/telemetry.py::write_event` for later backend replacement.
 
-A process-wide thread lock covers append/open/close to prevent interleaved lines
-within one process. Multiple processes sharing a path, crash durability, rotation,
-retention and ingestion monitoring are not provided; configure these before
-production deployment. Local telemetry I/O is synchronous. Restrict directory
-access and manage retention externally. Event timestamps/UUIDs identify events,
+A process-wide thread lock covers rotation/append/open/close to prevent interleaved
+lines within one process. The writer rotates before an append would exceed
+`EPUB_DOCTOR_TELEMETRY_MAX_BYTES` (default 10485760, 10 MiB), keeping
+`EPUB_DOCTOR_TELEMETRY_BACKUP_COUNT` archives (default 5). Both must be positive
+integers. `events.jsonl.1` is the newest archive; the oldest is deleted on rotation.
+New files are owner-only. With the defaults, new logs occupy at most 60 MiB.
+Oversized individual events, invalid settings and rotation failures drop telemetry
+without failing the EPUB operation. Disabled telemetry performs no rotation.
+
+This is size-based retention, with no age-based deletion: low-volume events can
+remain indefinitely. Existing oversized files are preserved as an archive until
+rotations discard them; when reducing the backup count, remove surplus numbered
+archives separately. Restrict directory access and manage any promised time-based
+retention, copies and backups externally. Use one writer process per path and do
+not run external rotation on the same files concurrently. Multiple processes
+sharing a path, crash durability and ingestion monitoring are not provided.
+Local telemetry I/O is synchronous. Event timestamps/UUIDs identify events,
 not users or books. Future engine enums must be deliberately added to the
 telemetry allowlists; unknown values are omitted/null.
+
+
+## EPUBCheck execution timeout
+
+Every EPUBCheck invocation has a 60-second timeout (`EPUBCHECK_TIMEOUT_SECONDS`
+in `src/validator.py`), including initial validation and repair revalidation.
+Python's `subprocess.run` kills and waits for the Java child on timeout. The
+validator raises `EPUBCheckError` with a fixed technical message, without copying
+captured stdout/stderr. Its temporary report directory is cleaned up.
+Inspect propagates this error; repair returns the existing `epubcheck_failure`
+result, removes temporary repair files and publishes no output. There is no retry.
+
+This limit is per checker invocation, not a total request deadline: a repair can
+run two validations. Process creation may delay timeout delivery. This change
+does not impose memory, captured-output, request-concurrency or ZIP parsing limits.
+
+
+## Concurrent EPUB operations
+
+A shared process-local admission limit covers service inspect and repair for the
+whole synchronous pipeline, including diagnosis, mutation and both validations.
+ChatGPT file tools acquire the same slot before downloading input and retain it
+through output delivery/publication and workspace cleanup. Nested adapter/service
+calls in the same thread reuse their slot; this is thread ownership only, not a
+queue or shared validation state. Slots are released on success and exceptions.
+
+Default capacity is **1**. Configure before starting the process:
+
+```sh
+export EPUB_DOCTOR_MAX_CONCURRENT_OPERATIONS=1
+```
+
+Only positive integers are accepted; invalid settings fail startup rather than
+disable protection. Restart to change capacity. At capacity, calls fail immediately
+with `ServerBusyError` at service level and `server_busy` MCP tool errors. No
+unbounded waiting queue, download or Java process is started for rejected calls.
+This admission rejection does not produce a repair result or a telemetry event.
+Successful/refused admitted operations keep their existing results and telemetry.
+
+Run one server process on the VPS. A limit of N in each of W processes permits up
+to N * W operations; this is not a host-wide or distributed limiter. Low-level
+engine/validator calls bypass service admission. The existing download store
+also requires a single owner process. Completed-file download routes remain
+available while EPUB processing is busy. Capacity does not cap memory per JVM;
+choose capacity after measuring memory and configure deployment memory limits
+separately. There is no Celery, broker or additional dependency.
+
+
+## Java heap and deployment memory limits
+
+The validator always launches `java -Xmx512m -jar ...` for both initial and final
+validation. The default is defined by `EPUBCHECK_MAX_HEAP` in `src/validator.py`;
+there is no arbitrary JVM-argument environment override. This limits Java heap,
+not the total resident memory of the JVM, Python service or child processes.
+Timeout and process-local concurrency admission continue to apply. A checker
+execution/report failure retains the existing `EPUBCheckError` /
+`epubcheck_failure` behavior and cannot publish an unvalidated output.
+
+Production must additionally enforce a container or systemd cgroup memory limit
+covering the server and its children. The Docker Compose configuration below
+sets a container limit; no live VPS deployment limit has been applied.
+An illustrative systemd service drop-in for capacity 1 is:
+
+```ini
+[Service]
+MemoryAccounting=yes
+MemoryHigh=768M
+MemoryMax=1G
+```
+
+These are example deployment values, not measured sizing recommendations.
+Leave headroom for native JVM memory, Python, ZIP processing and all concurrent
+operations; do not set the total service limit equal to the Java heap limit.
+`MemoryHigh` applies pressure/throttling; `MemoryMax` is the hard last line of
+defense and can trigger OOM termination. The server itself can be killed by the
+cgroup limit, so an HTTP error response or graceful cleanup is not guaranteed
+in that case. Deployment restart/temporary-file cleanup policies must account
+for abrupt termination. Increasing concurrency requires re-evaluating the total
+memory budget.
+
+References: [Java -Xmx](https://docs.oracle.com/en/java/javase/22/docs/specs/man/java.html),
+[systemd memory controls](https://www.freedesktop.org/software/systemd/man/latest/systemd.resource-control.html).
+
+
+## Docker Compose and Nginx
+
+The image includes Python 3.12, Java 17 and the complete bundled EPUBCheck JAR,
+libraries and licenses. It pins the currently tested MCP SDK to 2.3.0. Runtime
+uses UID/GID 10001, one server process, a read-only root filesystem and no Linux
+capabilities. `.dockerignore` allowlists only runtime source and bundled checker
+files: EPUBs, reports, credentials, local configuration, tests and git history
+are excluded from the build context. No native user file is baked into the image.
+
+```sh
+cp .env.example .env
+# Set EPUB_DOCTOR_PUBLIC_ORIGIN to your actual HTTPS origin, without a path/port.
+docker compose config --quiet
+docker compose up -d --build
+docker compose ps
+curl --fail http://127.0.0.1:8080/healthz
+```
+
+The provided Compose command supplies `--public-origin` to enable delivery and
+readiness. Standalone `docker run` must supply that option with the HTTP command
+as well; the image does not invent a public hostname.
+
+Only Nginx's port 8080 is published, on host loopback. Put an HTTPS reverse proxy
+or secure tunnel in front of `http://127.0.0.1:8080` and preserve the public Host
+and Origin headers. Certificates/TLS are managed by that outer proxy. Configure
+ChatGPT with `https://YOUR-HOST/mcp`; output links use the explicit configured
+HTTPS origin. Do not expose the app container port directly or scale app replicas.
+The server remains unauthenticated; rate limits are not authentication.
+
+Nginx accepts only `/mcp`, `/download/…` and `/healthz`. MCP requests have a 64 KiB
+body limit (file references, not raw EPUB uploads), per-peer 2 requests/second
+with burst 10, and a shared 5 requests/second limit with burst 20. Downloads use
+burst 5. Excess requests return HTTP 429 without queueing. Concurrent connections
+are limited to 8 per peer for MCP and 4 for downloads. The service's separate
+nonblocking capacity-1 guard still protects the complete heavy pipeline.
+The proxy preserves MCP headers/status and disables response buffering for
+streamed downloads; MCP upstream inactivity timeout is 240 seconds, not a total
+request deadline. App and proxy access logs are disabled. Nginx error logging is
+also disabled because errors can include bearer-token download URLs; app logs
+remain available with bounded Docker log rotation.
+
+Rate-limit keys use the actual connecting peer, not untrusted forwarded headers.
+Behind a single TLS proxy/tunnel, users may share one peer bucket. For per-user-IP
+limits, explicitly configure Nginx's real-IP module with only the trusted proxy
+addresses, or apply those limits at the outer TLS proxy. Never trust forwarded
+addresses from arbitrary clients. The shared global limit remains in force.
+
+`GET /healthz` returns 200 only after app lifespan startup with an open download
+store, an available checker JAR and a Java executable; otherwise 503. It performs
+no validation and stays responsive while the heavy-operation slot is occupied.
+This is lightweight readiness, not proof that a real repair succeeds. Compose
+waits for app health before starting Nginx; health failures after startup mark a
+container unhealthy but do not themselves restart it. Exit/crash restart policy
+is `unless-stopped`.
+
+Compose fixes concurrency to 1, app memory/swap ceiling to 1 GiB, app CPU to 1,
+and PID limit to 128; Nginx gets 64 MiB and CPU 0.5. Java heap remains 512 MiB.
+App `/tmp` is a 128 MiB tmpfs charged to container memory; Nginx uses 16 MiB.
+These are initial budgets, not measurements for your VPS. Adjust them against
+available host RAM and native JVM/Python memory usage before public deployment.
+The named `app-data` volume retains private repaired outputs and opt-in telemetry
+under `/data`; outputs expire via the existing cleanup policy. Do not share this
+volume with multiple app instances. Restart does not guarantee preservation of
+in-flight input workspaces. `docker compose down` retains the volume; `down -v`
+permanently removes stored outputs and telemetry. Docker image tags and transitive
+Python dependencies should be locked to reviewed digests/versions for repeatable
+release builds; there is no new application dependency or Celery service.

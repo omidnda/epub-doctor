@@ -14,6 +14,8 @@ def report(errors=0, warnings=0):
 def fake_run(monkeypatch, payload, code=0):
     def run(command, **kwargs):
         from pathlib import Path
+        assert command[:3] == ["java", "-Xmx512m", "-jar"]
+        assert kwargs["timeout"] == validator.EPUBCHECK_TIMEOUT_SECONDS
         if payload is not None:
             Path(command[-1]).write_text(payload)
         return CompletedProcess(command, code, "", "test stderr")
@@ -75,3 +77,103 @@ def test_real_valid_epub(make_epub):
     result = validator.validate_epub(str(make_epub()))
     assert result["valid"], result["messages"]
     assert result["fatal_count"] == result["error_count"] == result["warning_count"] == 0
+
+
+def test_timeout_preserves_error_contract_and_cleans_report(monkeypatch, tmp_path):
+    from pathlib import Path
+    from subprocess import TimeoutExpired
+    path = tmp_path / 'input.epub'
+    path.touch()
+    reports = []
+    original = TimeoutExpired(['java'], validator.EPUBCHECK_TIMEOUT_SECONDS,
+                              output=b'PRIVATE_OUTPUT', stderr=b'PRIVATE_STDERR')
+    def run(command, **kwargs):
+        assert kwargs['timeout'] == 60
+        reports.append(Path(command[-1]))
+        reports[-1].write_text('partial report')
+        raise original
+    monkeypatch.setattr(validator.subprocess, 'run', run)
+    with pytest.raises(validator.EPUBCheckError, match='timed out after 60 seconds') as caught:
+        validator.validate_epub(str(path))
+    assert caught.value.__cause__ is original
+    assert 'PRIVATE' not in str(caught.value)
+    assert not reports[0].parent.exists()
+
+
+def test_actual_subprocess_timeout(monkeypatch, tmp_path):
+    import subprocess
+    import sys
+    from pathlib import Path
+    path = tmp_path / 'input.epub'
+    path.touch()
+    reports = []
+    real_run = subprocess.run
+    def stalled(command, **kwargs):
+        reports.append(Path(command[-1]))
+        return real_run([sys.executable, '-c', 'import time; time.sleep(30)'], **kwargs)
+    monkeypatch.setattr(validator, 'EPUBCHECK_TIMEOUT_SECONDS', 0.1)
+    monkeypatch.setattr(validator.subprocess, 'run', stalled)
+    with pytest.raises(validator.EPUBCheckError, match='timed out') as caught:
+        validator.validate_epub(str(path))
+    assert isinstance(caught.value.__cause__, subprocess.TimeoutExpired)
+    assert not reports[0].parent.exists()
+
+
+@pytest.mark.parametrize('stage', ['initial', 'final'])
+def test_service_repair_timeout_never_publishes(monkeypatch, make_epub, tmp_path, stage):
+    from subprocess import TimeoutExpired
+    from src import service
+    source = make_epub('missing')
+    before = source.read_bytes()
+    output = tmp_path / 'out.epub'
+    original = validator.subprocess.run
+    reports = []
+    def run(command, **kwargs):
+        from pathlib import Path
+        reports.append(Path(command[-1]))
+        if stage == 'initial' or len(reports) == 2:
+            assert kwargs['timeout'] == validator.EPUBCHECK_TIMEOUT_SECONDS
+            raise TimeoutExpired(command, kwargs['timeout'])
+        return original(command, **kwargs)
+    monkeypatch.setattr(validator.subprocess, 'run', run)
+    result = service.repair_epub_file(str(source), str(output))
+    assert result['reason'] == 'epubcheck_failure'
+    assert result['final_valid'] is None
+    assert result['output_file'] is None and result['repaired'] == []
+    assert source.read_bytes() == before and not output.exists()
+    assert set(tmp_path.iterdir()) == {source}
+    assert len(reports) == (1 if stage == 'initial' else 2)
+    assert all(not path.parent.exists() for path in reports)
+
+
+def test_inspect_timeout_propagates(monkeypatch, make_epub):
+    from subprocess import TimeoutExpired
+    from src import service
+    def run(command, **kwargs):
+        raise TimeoutExpired(command, kwargs['timeout'])
+    monkeypatch.setattr(validator.subprocess, 'run', run)
+    with pytest.raises(validator.EPUBCheckError, match='timed out'):
+        service.inspect_epub(str(make_epub()))
+
+
+@pytest.mark.parametrize('stage', ['initial', 'final'])
+def test_heap_or_os_memory_failure_never_publishes(monkeypatch, make_epub, tmp_path, stage):
+    from src import service
+    source = make_epub('missing')
+    before = source.read_bytes()
+    output = tmp_path / 'out.epub'
+    real_run = validator.subprocess.run
+    calls = []
+    def run(command, **kwargs):
+        assert command[:3] == ['java', '-Xmx512m', '-jar']
+        calls.append(command)
+        if stage == 'initial' or len(calls) == 2:
+            return CompletedProcess(command, -9, '', 'memory failure')
+        return real_run(command, **kwargs)
+    monkeypatch.setattr(validator.subprocess, 'run', run)
+    result = service.repair_epub_file(str(source), str(output))
+    assert result['reason'] == 'epubcheck_failure'
+    assert result['repaired'] == [] and result['output_file'] is None
+    assert source.read_bytes() == before and not output.exists()
+    assert set(tmp_path.iterdir()) == {source}
+    assert len(calls) == (1 if stage == 'initial' else 2)

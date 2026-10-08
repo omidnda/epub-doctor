@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import logging
+import shutil
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
@@ -19,7 +20,8 @@ from starlette.background import BackgroundTask
 from starlette.requests import ClientDisconnect
 
 from . import mcp_server as local_mcp
-from . import service
+from . import service, validator
+from .operation_limit import ServerBusyError, operation_slot
 from .chatgpt_files import FileDownloadError, OpenAIFile, downloaded_epub
 from .temporary_downloads import (
     CLEANUP_INTERVAL_SECONDS, DEFAULT_STORAGE_ROOT, MAX_DOWNLOAD_SECONDS, DownloadStoreError,
@@ -76,9 +78,9 @@ def inspect_epub(file: OpenAIFile) -> Inspection:
     temporarily and deleted. Returns the unchanged service inspection result.
     """
     try:
-        with downloaded_epub(file) as workspace:
+        with operation_slot(), downloaded_epub(file) as workspace:
             return local_mcp.inspect_epub(str(workspace / 'input.epub'))
-    except FileDownloadError as exc:
+    except (FileDownloadError, ServerBusyError) as exc:
         raise ToolError(str(exc)) from None
 
 
@@ -96,7 +98,7 @@ def repair_epub(file: OpenAIFile) -> RepairResponse:
 
 def _repair_epub(file, store=None, origin=None):
     try:
-        with downloaded_epub(file) as workspace:
+        with operation_slot(), downloaded_epub(file) as workspace:
             output = workspace / 'repaired.epub'
             result = service.repair_epub_file(str(workspace / 'input.epub'), str(output))
             delivery = {'status': 'unavailable', 'delivered': False, 'detail': OUTPUT_LIMITATION}
@@ -114,7 +116,7 @@ def _repair_epub(file, store=None, origin=None):
             # Core semantics are unchanged; its internal output path is never public.
             return {'repair': {**result, 'output_file': None},
                     'file_output': delivery}
-    except FileDownloadError as exc:
+    except (FileDownloadError, ServerBusyError) as exc:
         raise ToolError(str(exc)) from None
 
 
@@ -190,6 +192,16 @@ def create_download_app(store, origin, *, host='127.0.0.1', security=None):
     configured = create_server(store=store, origin=origin)
     app = configured.streamable_http_app(stateless_http=True, json_response=True,
                                          host=host, transport_security=security)
+    app.state.ready = False
+
+    async def health(request):
+        # Lightweight readiness only: never execute Java or acquire processing capacity.
+        ready = (app.state.ready and store._root_fd is not None
+                 and validator.EPUBCHECK_JAR.is_file() and shutil.which('java') is not None)
+        return Response('ok' if ready else 'unavailable', status_code=200 if ready else 503,
+                        media_type='text/plain', headers=DOWNLOAD_HEADERS)
+
+    app.add_route('/healthz', health, methods=['GET'])
     original_lifespan = app.router.lifespan_context
 
     async def sweep():
@@ -205,9 +217,11 @@ def create_download_app(store, origin, *, host='127.0.0.1', security=None):
         store.cleanup()
         async with original_lifespan(app):
             task = asyncio.create_task(sweep())
+            app.state.ready = True
             try:
                 yield
             finally:
+                app.state.ready = False
                 task.cancel()
                 try:
                     await task

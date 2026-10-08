@@ -8,6 +8,7 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 from . import service
+from .operation_limit import ServerBusyError
 from .validator import EPUBCheckError
 from .zip_inspection import UnsafeZipError
 
@@ -24,6 +25,8 @@ def inspect_epub(path: str) -> dict[str, object]:
     """
     try:
         return service.inspect_epub(path)
+    except ServerBusyError as exc:
+        raise ToolError(str(exc)) from None
     except FileNotFoundError as exc:
         raise ToolError(f"input_not_found: {exc}") from exc
     except EPUBCheckError as exc:
@@ -48,7 +51,10 @@ def repair_epub(input_path: str, output_path: str) -> dict[str, object]:
     structured service results; inspect reason, final_valid and output_file.
     Existing inputs/outputs are never overwritten. No URLs or uploads.
     """
-    return service.repair_epub_file(input_path, output_path)
+    try:
+        return service.repair_epub_file(input_path, output_path)
+    except ServerBusyError as exc:
+        raise ToolError(str(exc)) from None
 
 
 def main():

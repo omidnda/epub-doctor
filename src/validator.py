@@ -6,6 +6,8 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 EPUBCHECK_JAR = PROJECT_ROOT / "vendor" / "epubcheck-5.4.0" / "epubcheck.jar"
+EPUBCHECK_TIMEOUT_SECONDS = 60
+EPUBCHECK_MAX_HEAP = "512m"
 
 
 class EPUBCheckError(RuntimeError):
@@ -24,11 +26,17 @@ def validate_epub(epub_path: str) -> dict:
         report_path = Path(directory) / "report.json"
         try:
             result = subprocess.run(
-                ["java", "-jar", str(EPUBCHECK_JAR), str(epub_path),
+                ["java", f"-Xmx{EPUBCHECK_MAX_HEAP}", "-jar", str(EPUBCHECK_JAR), str(epub_path),
                  "--json", str(report_path)],
                 capture_output=True,
                 text=True,
+                timeout=EPUBCHECK_TIMEOUT_SECONDS,
             )
+        except subprocess.TimeoutExpired as exc:
+            # run() kills and waits for the child before raising; omit captured output.
+            raise EPUBCheckError(
+                f"EPUBCheck timed out after {EPUBCHECK_TIMEOUT_SECONDS} seconds"
+            ) from exc
         except FileNotFoundError as exc:
             raise EPUBCheckError("Java executable not found") from exc
         except OSError as exc:

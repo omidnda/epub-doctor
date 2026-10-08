@@ -4,16 +4,19 @@ Inspection propagates existing validator/diagnoser exceptions: FileNotFoundError
 or other OSError for input access, EPUBCheckError for execution/report failures,
 and ZIP/decompression exceptions or UnsafeZipError for diagnosis failures.
 No partial inspection result is returned on failure. Repair retains the engine's
-structured failure results (including optional detail). Unexpected programming
+structured failure results (including optional detail). Both entry points raise
+ServerBusyError before processing when process capacity is exhausted. Unexpected programming
 errors propagate from both entry points.
 """
 
 from . import telemetry
 from .diagnoser import diagnose_epub
+from .operation_limit import limited_operation
 from .repairer import _repair_epub as repair_epub
 from .validator import validate_epub
 
 
+@limited_operation
 def inspect_epub(path: str) -> dict:
     """Validate and diagnose read-only; create no output EPUB.
 
@@ -50,6 +53,7 @@ def _inspection_result(validation, safe_repairs):
     }
 
 
+@limited_operation
 def repair_epub_file(input_path: str, output_path: str) -> dict:
     """Delegate to the safe pipeline, preserving its result and failure policy."""
     started = _observe(telemetry.start)

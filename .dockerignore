@@ -1,0 +1,9 @@
+**
+!Dockerfile
+!src/
+!src/**
+!vendor/
+!vendor/epubcheck-5.4.0/
+!vendor/epubcheck-5.4.0/**
+**/__pycache__/
+**/*.pyc

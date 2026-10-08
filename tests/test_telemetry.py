@@ -14,6 +14,8 @@ from src.validator import EPUBCheckError
 def isolated_configuration(monkeypatch):
     monkeypatch.delenv('EPUB_DOCTOR_TELEMETRY_ENABLED', raising=False)
     monkeypatch.delenv('EPUB_DOCTOR_TELEMETRY_PATH', raising=False)
+    monkeypatch.delenv('EPUB_DOCTOR_TELEMETRY_MAX_BYTES', raising=False)
+    monkeypatch.delenv('EPUB_DOCTOR_TELEMETRY_BACKUP_COUNT', raising=False)
 
 
 @pytest.fixture
@@ -26,6 +28,69 @@ def storage(monkeypatch, tmp_path):
 
 def events(storage):
     return [json.loads(line) for line in storage.read_text().splitlines()]
+
+
+def test_rotation_keeps_complete_records_and_discards_oldest(storage, monkeypatch):
+    monkeypatch.setenv('EPUB_DOCTOR_TELEMETRY_MAX_BYTES', '18')
+    monkeypatch.setenv('EPUB_DOCTOR_TELEMETRY_BACKUP_COUNT', '2')
+    for index in range(8):
+        telemetry.write_event({'i': index})  # Nine ASCII bytes per line.
+    assert events(storage) == [{'i': 6}, {'i': 7}]
+    assert [json.loads(line) for line in Path(str(storage) + '.1').read_text().splitlines()] == [
+        {'i': 4}, {'i': 5}]
+    assert [json.loads(line) for line in Path(str(storage) + '.2').read_text().splitlines()] == [
+        {'i': 2}, {'i': 3}]
+    assert len(list(storage.parent.iterdir())) == 3
+    for path in storage.parent.iterdir():
+        assert path.stat().st_size == 18
+        assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_concurrent_rotation_does_not_lose_or_interleave_records(storage, monkeypatch):
+    monkeypatch.setenv('EPUB_DOCTOR_TELEMETRY_MAX_BYTES', '100')
+    monkeypatch.setenv('EPUB_DOCTOR_TELEMETRY_BACKUP_COUNT', '30')
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        list(pool.map(lambda index: telemetry.write_event({'i': index}), range(120)))
+    collected = []
+    for path in storage.parent.iterdir():
+        assert path.stat().st_size <= 100
+        collected.extend(json.loads(line)['i'] for line in path.read_text().splitlines())
+    assert sorted(collected) == list(range(120))
+
+
+@pytest.mark.parametrize('setting,value', [
+    ('EPUB_DOCTOR_TELEMETRY_MAX_BYTES', '0'),
+    ('EPUB_DOCTOR_TELEMETRY_MAX_BYTES', 'invalid'),
+    ('EPUB_DOCTOR_TELEMETRY_MAX_BYTES', '1'),
+    ('EPUB_DOCTOR_TELEMETRY_BACKUP_COUNT', '-1'),
+    ('EPUB_DOCTOR_TELEMETRY_BACKUP_COUNT', 'invalid'),
+])
+def test_rotation_configuration_failure_is_fail_open(storage, monkeypatch, setting, value):
+    monkeypatch.setenv(setting, value)
+    validation = stub_inspect(monkeypatch)
+    assert service.inspect_epub('PRIVATE_INPUT.epub')['publication'] is validation['publication']
+    assert not storage.exists()
+
+
+def test_rotation_io_failure_is_fail_open(storage, monkeypatch):
+    storage.parent.mkdir()
+    monkeypatch.setenv('EPUB_DOCTOR_TELEMETRY_MAX_BYTES', '1200')
+    storage.write_text('x' * 1200)
+    monkeypatch.setattr(Path, 'replace', lambda *args: (_ for _ in ()).throw(OSError('rotation failure')))
+    validation = stub_inspect(monkeypatch)
+    assert service.inspect_epub('PRIVATE_INPUT.epub')['publication'] is validation['publication']
+    assert storage.read_text() == 'x' * 1200
+
+
+def test_disabled_telemetry_does_not_rotate_existing_file(storage, monkeypatch):
+    storage.parent.mkdir()
+    storage.write_text('existing\n')
+    monkeypatch.setenv('EPUB_DOCTOR_TELEMETRY_ENABLED', '0')
+    monkeypatch.setenv('EPUB_DOCTOR_TELEMETRY_MAX_BYTES', '1')
+    stub_inspect(monkeypatch)
+    service.inspect_epub('PRIVATE_INPUT.epub')
+    assert storage.read_text() == 'existing\n'
+    assert list(storage.parent.iterdir()) == [storage]
 
 
 def report(valid=False):
