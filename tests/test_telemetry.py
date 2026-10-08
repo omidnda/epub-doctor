@@ -1,0 +1,256 @@
+import json
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
+from pathlib import Path
+from uuid import UUID
+
+import pytest
+
+from src import service, telemetry
+from src.validator import EPUBCheckError
+
+
+@pytest.fixture(autouse=True)
+def isolated_configuration(monkeypatch):
+    monkeypatch.delenv('EPUB_DOCTOR_TELEMETRY_ENABLED', raising=False)
+    monkeypatch.delenv('EPUB_DOCTOR_TELEMETRY_PATH', raising=False)
+
+
+@pytest.fixture
+def storage(monkeypatch, tmp_path):
+    path = tmp_path / 'logs' / 'events.jsonl'
+    monkeypatch.setenv('EPUB_DOCTOR_TELEMETRY_ENABLED', '1')
+    monkeypatch.setenv('EPUB_DOCTOR_TELEMETRY_PATH', str(path))
+    return path
+
+
+def events(storage):
+    return [json.loads(line) for line in storage.read_text().splitlines()]
+
+
+def report(valid=False):
+    return dict(valid=valid, fatal_count=0, error_count=0 if valid else 2,
+                warning_count=1, publication={'title': 'PRIVATE_TITLE'},
+                messages=[{'ID': 'RSC-008', 'message': 'PRIVATE_MESSAGE',
+                           'locations': [{'path': 'PRIVATE_INTERNAL_FILE'}]},
+                          {'ID': 'OPF-014'}, {'ID': 'RSC-008'}])
+
+
+def stub_inspect(monkeypatch, valid=False):
+    validation = report(valid)
+    monkeypatch.setattr(service, 'validate_epub', lambda path: validation)
+    monkeypatch.setattr(service, 'diagnose_epub', lambda *args:
+                        [] if valid else ['manifest_missing_referenced_resource'])
+    return validation
+
+
+@pytest.mark.parametrize('valid', [True, False])
+def test_inspect_event(storage, monkeypatch, valid):
+    validation = stub_inspect(monkeypatch, valid)
+    result = service.inspect_epub('PRIVATE_INPUT.epub')
+    event, = events(storage)
+    assert result['publication'] is validation['publication']
+    assert event['action'] == 'inspect'
+    assert event['operation_completed'] is True
+    assert event['original_valid'] is event['final_valid'] is valid
+    assert event['repair_success'] is event['repair_attempted'] is None
+    assert event['confirmed_safe_repairs'] == ([] if valid else ['manifest_missing_referenced_resource'])
+    assert event['epubcheck_codes'] == ['OPF-014', 'RSC-008']
+    assert [event[k] for k in ('fatal_count', 'error_count', 'warning_count')] == [0, 0 if valid else 2, 1]
+    assert event['schema_version'] == 1
+    assert UUID(event['event_id']).version == 4
+    assert datetime.fromisoformat(event['timestamp']).utcoffset() == timedelta(0)
+    assert event['processing_time_ms'] >= 0
+    assert event['file_size_bucket'] is None
+
+
+@pytest.mark.parametrize('reason,success,attempted', [
+    (None, True, True), ('already_valid', False, False),
+    ('no_supported_repair', False, False), ('signatures_or_encryption', False, False),
+    ('revalidation_failed', False, True), ('epubcheck_failure', False, None),
+    ('output_write_failed', False, None), ('opf030_identifier_value_invalid', False, None),
+])
+def test_repair_event(storage, monkeypatch, reason, success, attempted):
+    result = dict(original_valid=reason == 'already_valid',
+                  detected=[] if attempted is False else ['mimetype_missing'],
+                  repaired=['mimetype_missing'] if success else [],
+                  final_valid=success or reason in ('already_valid', 'opf030_identifier_value_invalid'),
+                  output_file='PRIVATE_OUTPUT.epub' if success else None,
+                  remaining_messages=report()['messages'], reason=reason, detail='PRIVATE_DETAIL')
+    monkeypatch.setattr(service, 'repair_epub', lambda *args: result)
+    assert service.repair_epub_file('PRIVATE_INPUT.epub', 'PRIVATE_OUTPUT.epub') is result
+    event, = events(storage)
+    assert event['action'] == 'repair'
+    assert event['repair_success'] is success
+    assert event['repair_attempted'] is attempted
+    assert event['refusal_reason'] == reason
+    assert event['epubcheck_codes'] == ['OPF-014', 'RSC-008']
+    assert event['fatal_count'] is event['error_count'] is event['warning_count'] is None
+
+
+def fail(*args, **kwargs):
+    raise RuntimeError('PRIVATE_FAILURE')
+
+
+@pytest.mark.parametrize('target', ['write_event', 'record', 'start', 'versions', 'file_size_bucket'])
+@pytest.mark.parametrize('action', ['inspect', 'repair'])
+def test_observer_failure_preserves_result(storage, monkeypatch, target, action):
+    stub_inspect(monkeypatch)
+    expected = {'reason': 'no_supported_repair'}
+    monkeypatch.setattr(service, 'repair_epub', lambda *args: expected)
+    monkeypatch.setattr(telemetry, target, fail)
+    if action == 'inspect':
+        assert service.inspect_epub('input.epub')['valid'] is False
+    else:
+        assert service.repair_epub_file('input.epub', 'output.epub') is expected
+    if target in ('versions', 'file_size_bucket'):
+        event, = events(storage)
+        if target == 'versions':
+            assert event['epub_doctor_version'] is event['epubcheck_version'] is None
+        else:
+            assert event['file_size_bucket'] is None
+
+
+@pytest.mark.parametrize('action', ['inspect', 'repair'])
+@pytest.mark.parametrize('broken_writer', [True, False])
+def test_original_exception_preserved(storage, monkeypatch, action, broken_writer):
+    original = EPUBCheckError('PRIVATE_EXCEPTION_PATH')
+    def broken(*args):
+        raise original
+    monkeypatch.setattr(service, 'validate_epub' if action == 'inspect' else 'repair_epub', broken)
+    if broken_writer:
+        monkeypatch.setattr(telemetry, 'write_event', fail)
+    with pytest.raises(EPUBCheckError) as caught:
+        if action == 'inspect':
+            service.inspect_epub('input.epub')
+        else:
+            service.repair_epub_file('input.epub', 'output.epub')
+    assert caught.value is original
+    if not broken_writer:
+        event, = events(storage)
+        assert event['operation_completed'] is False
+        assert event['original_valid'] is event['final_valid'] is None
+        assert 'PRIVATE' not in storage.read_text()
+
+
+def test_privacy_allowlist(storage, monkeypatch):
+    validation = stub_inspect(monkeypatch)
+    validation['publication'].update(author='PRIVATE_AUTHOR', ISBN='PRIVATE_ISBN',
+                                     identifier='PRIVATE_ID', url='https://PRIVATE_URL')
+    validation['messages'].append({'ID': 'PRIVATE_CODE'})
+    service.inspect_epub('PRIVATE_INPUT.epub')
+    result = dict(original_valid=False, detected=['mimetype_missing', 'PRIVATE_DIAGNOSIS'],
+                  repaired=[], final_valid=False, output_file='PRIVATE_OUTPUT.epub',
+                  remaining_messages=validation['messages'], reason='PRIVATE_REASON',
+                  detail='PRIVATE_DETAIL', input_path='PRIVATE_INPUT', user_id='PRIVATE_USER',
+                  ip_address='PRIVATE_IP', file_hash='PRIVATE_HASH', publication=validation['publication'])
+    monkeypatch.setattr(service, 'repair_epub', lambda *args: result)
+    service.repair_epub_file('PRIVATE_INPUT.epub', 'PRIVATE_OUTPUT.epub')
+    assert 'PRIVATE' not in storage.read_text()
+    permitted = set('''schema_version event_id timestamp action operation_completed
+    epubcheck_codes confirmed_safe_repairs original_valid repair_attempted repair_success
+    final_valid refusal_reason fatal_count error_count warning_count file_size_bucket
+    processing_time_ms epub_doctor_version epubcheck_version'''.split())
+    assert all(set(event) == permitted for event in events(storage))
+
+
+@pytest.mark.parametrize('size,bucket', [(0, '<1MB'), (1024**2-1, '<1MB'),
+    (1024**2, '1-5MB'), (5*1024**2-1, '1-5MB'), (5*1024**2, '5-20MB'),
+    (20*1024**2, '20-50MB'), (50*1024**2, '>50MB')])
+def test_size_boundaries(tmp_path, size, bucket):
+    path = tmp_path / 'sparse.epub'
+    with path.open('wb') as output:
+        output.truncate(size)
+    assert telemetry.file_size_bucket(path) == bucket
+
+
+@pytest.mark.parametrize('enabled,path_present', [(None, True), ('0', True), ('true', True), ('1', False)])
+def test_disabled(monkeypatch, tmp_path, enabled, path_present):
+    path = tmp_path / 'never.jsonl'
+    if enabled is not None:
+        monkeypatch.setenv('EPUB_DOCTOR_TELEMETRY_ENABLED', enabled)
+    if path_present:
+        monkeypatch.setenv('EPUB_DOCTOR_TELEMETRY_PATH', str(path))
+    stub_inspect(monkeypatch)
+    monkeypatch.setattr(telemetry, 'file_size_bucket', fail)
+    monkeypatch.setattr(telemetry, 'versions', fail)
+    service.inspect_epub('input.epub')
+    assert telemetry.start() is None
+    assert not path.exists()
+
+
+@pytest.mark.parametrize('failure', ['serialization', 'directory', 'open'])
+def test_storage_failures(storage, monkeypatch, failure):
+    stub_inspect(monkeypatch)
+    if failure == 'serialization':
+        monkeypatch.setattr(telemetry.json, 'dumps', fail)
+    elif failure == 'directory':
+        monkeypatch.setattr(Path, 'mkdir', fail)
+    else:
+        monkeypatch.setattr(telemetry.os, 'open', fail)
+    assert service.inspect_epub('input.epub')['valid'] is False
+
+
+def test_concurrent_jsonl(storage):
+    def emit(_):
+        telemetry.record('inspect', 'unknown.epub', telemetry.start(), validation=report(), completed=True)
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        list(pool.map(emit, range(120)))
+    result = events(storage)
+    assert len(result) == 120
+    assert len({event['event_id'] for event in result}) == 120
+    assert all(event['schema_version'] == 1 for event in result)
+
+
+def test_monotonic_nonnegative(storage, monkeypatch):
+    monkeypatch.setattr(telemetry.time, 'monotonic_ns', lambda: 10)
+    telemetry.record('inspect', 'unknown.epub', 20)
+    assert events(storage)[0]['processing_time_ms'] == 0
+
+
+def test_real_pipeline(storage, make_epub, tmp_path):
+    source = make_epub('missing')
+    before = source.read_bytes()
+    assert service.inspect_epub(str(source))['safe_repairs'] == ['mimetype_missing']
+    output = tmp_path / 'repaired.epub'
+    result = service.repair_epub_file(str(source), str(output))
+    assert result['repaired'] == ['mimetype_missing']
+    assert output.exists() and source.read_bytes() == before
+    inspection, repair = events(storage)
+    assert inspection['file_size_bucket'] == '<1MB'
+    assert 'PKG-006' in inspection['epubcheck_codes']
+    assert repair['repair_success'] is True
+    assert repair['epubcheck_codes'] == []
+
+
+@pytest.mark.parametrize('fixture,reason', [('missing.epub', 'no_supported_repair'),
+                                           ('unrelated-error.epub', 'revalidation_failed')])
+def test_real_refusal_and_revalidation(storage, tmp_path, fixture, reason):
+    source = Path(__file__).parent / 'fixtures' / 'rsc008' / fixture
+    before = source.read_bytes()
+    output = tmp_path / 'out.epub'
+    result = service.repair_epub_file(str(source), str(output))
+    assert result['reason'] == reason
+    assert source.read_bytes() == before and not output.exists()
+    event, = events(storage)
+    assert event['repair_success'] is False
+    assert event['refusal_reason'] == reason
+    if reason == 'revalidation_failed':
+        assert event['repair_attempted'] is True
+        assert event['confirmed_safe_repairs'] == ['manifest_missing_referenced_resource']
+
+
+def test_diagnosis_exception_preserves_partial_evidence(storage, monkeypatch):
+    validation = stub_inspect(monkeypatch)
+    original = TypeError('PRIVATE_PROGRAMMING_ERROR')
+    def broken(*args):
+        raise original
+    monkeypatch.setattr(service, 'diagnose_epub', broken)
+    with pytest.raises(TypeError) as caught:
+        service.inspect_epub('PRIVATE_INPUT')
+    assert caught.value is original
+    event, = events(storage)
+    assert event['operation_completed'] is False
+    assert event['original_valid'] is validation['valid']
+    assert event['confirmed_safe_repairs'] == []
+    assert 'PRIVATE' not in storage.read_text()

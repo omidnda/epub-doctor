@@ -799,3 +799,72 @@ java -jar vendor/epubcheck-5.4.0/epubcheck.jar /tmp/opf030-repaired.epub
 ```
 
 Choose an absent output path; existing files are not replaced.
+
+## Optional privacy-preserving telemetry
+
+Telemetry observes `service.inspect_epub()` and `service.repair_epub_file()`;
+CLI and MCP callers using this boundary are covered. Direct low-level engine
+calls are not instrumented. Engine safety, diagnosis, output and return contracts
+are unchanged. No additional dependency is required.
+
+Collection is **disabled by default**. Both variables are required to enable it:
+
+```sh
+export EPUB_DOCTOR_TELEMETRY_ENABLED=1
+export EPUB_DOCTOR_TELEMETRY_PATH=/tmp/epub-doctor-dev/events.jsonl
+```
+
+Use a dedicated writable path outside the source tree for deployment. Set
+`EPUB_DOCTOR_TELEMETRY_ENABLED=0` (or unset it) to disable collection; no telemetry
+file lookup or version lookup occurs when disabled. Tests use temporary paths.
+The configured directory is created on first write. New files use mode `0600`;
+existing file permissions are not changed.
+
+Each JSONL line contains exactly these schema-v1 fields:
+
+```text
+schema_version, event_id, timestamp, action, operation_completed,
+epubcheck_codes, confirmed_safe_repairs, original_valid, repair_attempted,
+repair_success, final_valid, refusal_reason, fatal_count, error_count,
+warning_count, file_size_bucket, processing_time_ms, epub_doctor_version,
+epubcheck_version
+```
+
+IDs are random UUID4 values; timestamps are UTC. Elapsed milliseconds use a
+monotonic clock. Codes are sorted, unique `AAA-000` technical IDs. Diagnoses and
+refusal reasons use explicit known engine-enum allowlists. Events never copy
+whole reports/results, messages, locations, paths, filenames, metadata, detail,
+identifiers, content, URLs, user/account/IP information or EPUB hashes.
+File sizes use binary MiB boundaries: `[0,1)`, `[1,5)`, `[5,20)`, `[20,50)` and
+`[50,infinity)` MiB, labeled `<1MB`, `1-5MB`, `5-20MB`, `20-50MB`, `>50MB`.
+The last label includes exactly 50 MiB. Unavailable values are JSON `null`.
+
+`operation_completed` distinguishes normal service returns (including refusals)
+from propagated exceptions; it does not mean repair succeeded. `repair_success`
+requires successful validation, nonempty published repairs, an output and no
+refusal. `already_valid` is not a repair success. `repair_attempted` is true when
+success or failed revalidation proves an attempt, false for proven early exits,
+and null when the existing result cannot establish the mutation stage. Inspect
+uses null for both repair fields.
+
+Inspect counts/codes describe its validation report. Repair codes describe the
+**latest** `remaining_messages`, which may be the original or final report;
+repair counts are null because the engine does not expose counts. No extra
+validation/diagnosis runs are performed to collect telemetry. Doctor version
+comes from installed distribution metadata, or null when unavailable. Checker
+version is null: the current result has no trustworthy runtime version field,
+and telemetry does not infer it from a directory name or execute another checker.
+
+Observation, configuration, size/version lookup, serialization and writes are
+best effort. Observer exceptions are suppressed separately from the operation;
+original service exceptions are re-raised unchanged, with no exception text in
+events. Failed collection is silent and can lose events. The writer is isolated
+in `src/telemetry.py::write_event` for later backend replacement.
+
+A process-wide thread lock covers append/open/close to prevent interleaved lines
+within one process. Multiple processes sharing a path, crash durability, rotation,
+retention and ingestion monitoring are not provided; configure these before
+production deployment. Local telemetry I/O is synchronous. Restrict directory
+access and manage retention externally. Event timestamps/UUIDs identify events,
+not users or books. Future engine enums must be deliberately added to the
+telemetry allowlists; unknown values are omitted/null.
