@@ -10,7 +10,7 @@ errors propagate from both entry points.
 
 from . import telemetry
 from .diagnoser import diagnose_epub
-from .repairer import repair_epub
+from .repairer import _repair_epub as repair_epub
 from .validator import validate_epub
 
 
@@ -53,12 +53,20 @@ def _inspection_result(validation, safe_repairs):
 def repair_epub_file(input_path: str, output_path: str) -> dict:
     """Delegate to the safe pipeline, preserving its result and failure policy."""
     started = _observe(telemetry.start)
+    evidence = {"initial": None, "final": None}
+
+    def observe_validation(phase, validation):
+        evidence[phase] = _observe(telemetry.validation_codes, validation)
+
     try:
-        result = repair_epub(input_path, output_path)
+        if started is None:
+            result = repair_epub(input_path, output_path)
+        else:
+            result = repair_epub(input_path, output_path, _validation_observer=observe_validation)
     except Exception:
-        _observe(telemetry.record, "repair", input_path, started)
+        _observe(telemetry.record, "repair", input_path, started, evidence=evidence)
         raise
-    _observe(telemetry.record, "repair", input_path, started, result=result, completed=True)
+    _observe(telemetry.record, "repair", input_path, started, result=result, completed=True, evidence=evidence)
     return result
 
 

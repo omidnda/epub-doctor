@@ -44,6 +44,20 @@ def repair_epub(input_path: str, output_path: str) -> dict:
     Existing output files are never replaced. `repaired` is populated only
     after a valid recheck and successful publication of the new output.
     """
+    return _repair_epub(input_path, output_path)
+
+
+def _observe_validation(observer, phase, validation):
+    """Observation must never change engine results or exception handling."""
+    if observer is not None:
+        try:
+            observer(phase, validation)
+        except Exception:
+            pass
+
+
+def _repair_epub(input_path: str, output_path: str, *, _validation_observer=None) -> dict:
+    """Internal pipeline; public callers receive only the existing repair result."""
     source, destination = Path(input_path), Path(output_path)
     result = {
         "original_valid": None,
@@ -59,6 +73,7 @@ def repair_epub(input_path: str, output_path: str) -> dict:
     stage = "input"
     try:
         original = validate_epub(str(source))
+        _observe_validation(_validation_observer, "initial", original)
         result.update(original_valid=original["valid"], final_valid=original["valid"],
                       remaining_messages=original["messages"])
         # Inspect directly, never extract archive-controlled paths to disk.
@@ -188,6 +203,7 @@ def repair_epub(input_path: str, output_path: str) -> dict:
 
         stage = "revalidation"
         final = validate_epub(str(temporary_path))
+        _observe_validation(_validation_observer, "final", final)
         result.update(final_valid=final["valid"], remaining_messages=final["messages"])
         if ("package_unique_identifier_unresolved" in result["detected"]
                 and any(message["ID"] == "OPF-085" for message in final["messages"])):

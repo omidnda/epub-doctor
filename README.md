@@ -820,11 +820,12 @@ file lookup or version lookup occurs when disabled. Tests use temporary paths.
 The configured directory is created on first write. New files use mode `0600`;
 existing file permissions are not changed.
 
-Each JSONL line contains exactly these schema-v1 fields:
+Each JSONL line contains exactly these schema-v2 fields:
 
 ```text
 schema_version, event_id, timestamp, action, operation_completed,
-epubcheck_codes, confirmed_safe_repairs, original_valid, repair_attempted,
+initial_epubcheck_codes, final_epubcheck_codes, confirmed_safe_repairs,
+original_valid, repair_attempted,
 repair_success, final_valid, refusal_reason, fatal_count, error_count,
 warning_count, file_size_bucket, processing_time_ms, epub_doctor_version,
 epubcheck_version
@@ -847,13 +848,30 @@ success or failed revalidation proves an attempt, false for proven early exits,
 and null when the existing result cannot establish the mutation stage. Inspect
 uses null for both repair fields.
 
-Inspect counts/codes describe its validation report. Repair codes describe the
-**latest** `remaining_messages`, which may be the original or final report;
-repair counts are null because the engine does not expose counts. No extra
-validation/diagnosis runs are performed to collect telemetry. Doctor version
-comes from installed distribution metadata, or null when unavailable. Checker
-version is null: the current result has no trustworthy runtime version field,
-and telemetry does not infer it from a directory name or execute another checker.
+Schema version 2 replaces the ambiguous v1 `epubcheck_codes` field; no repository
+consumer requires that legacy field. Both new fields exist in every event:
+
+- `initial_epubcheck_codes`: sorted unique codes from the initial validation.
+  Null means that validation did not return usable evidence (or observation failed).
+- `final_epubcheck_codes`: sorted unique codes from the actual revalidation.
+  Null means no usable revalidation evidence; an empty list means revalidation
+  returned a report with no matching codes. Inspect always uses null here.
+
+Refusals before revalidation and `already_valid` preserve initial codes and use
+null for final codes. Successful repairs and failed revalidation retain both
+sets independently. `remaining_messages` is never used as validation-stage evidence.
+The two existing validator calls notify a private optional observer inside the
+repair pipeline. Service retains only sanitized code lists in a per-call local
+context. Public `repair_epub` and service results receive no additional fields;
+there is no global/thread-local state and no additional validation, diagnosis,
+EPUB parsing or repair. Observer exceptions are isolated inside the engine as
+well as at the service boundary. With telemetry disabled no observer is passed.
+
+Inspect counts describe its validation report. Repair counts remain null because
+the engine does not expose counts. Doctor version comes from installed distribution
+metadata, or null when unavailable. Checker version is null: the current result
+has no trustworthy runtime version field, and telemetry does not infer it from a
+directory name or execute another checker.
 
 Observation, configuration, size/version lookup, serialization and writes are
 best effort. Observer exceptions are suppressed separately from the operation;

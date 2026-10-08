@@ -89,15 +89,32 @@ def _boolean(value):
     return value if type(value) is bool else None
 
 
-def record(action, path, started, result=None, validation=None, diagnoses=None, completed=False):
+def _code_ids(values):
+    if values is None:
+        return None
+    return sorted({value for value in values if isinstance(value, str)
+                   and re.fullmatch(r'[A-Z]{3}-[0-9]{3}', value)})
+
+
+def validation_codes(validation):
+    """Extract only sorted technical IDs; None means no usable validation evidence."""
+    if validation is None:
+        return None
+    return _code_ids(message.get('ID') for message in validation.get('messages', [])
+                     if isinstance(message, dict))
+
+
+def record(action, path, started, result=None, validation=None, diagnoses=None,
+           completed=False, evidence=None):
     """Fail-open applies only to observation, never to the underlying operation."""
     try:
         if started is None:
             return
         result = result or {}
+        initial_codes = validation_codes(validation) if action == "inspect" else (evidence or {}).get("initial")
+        final_codes = (evidence or {}).get("final") if action == "repair" else None
         validation = validation or {}
         repair = action == 'repair'
-        messages = result.get('remaining_messages', []) if repair else validation.get('messages', [])
         confirmed = result.get('detected', []) if repair else (diagnoses or [])
         success = (result.get('final_valid') is True and bool(result.get('repaired'))
                    and bool(result.get('output_file')) and result.get('reason') is None)
@@ -114,14 +131,13 @@ def record(action, path, started, result=None, validation=None, diagnoses=None, 
                 attempted = False
         doctor_version, checker_version = _optional(versions) or (None, None)
         event = {
-            'schema_version': 1,
+            'schema_version': 2,
             'event_id': str(uuid4()),
             'timestamp': datetime.now(timezone.utc).isoformat(),
             'action': action,
             'operation_completed': completed,
-            'epubcheck_codes': sorted({m['ID'] for m in messages
-                                      if isinstance(m, dict) and isinstance(m.get('ID'), str)
-                                      and re.fullmatch(r'[A-Z]{3}-[0-9]{3}', m['ID'])}),
+            'initial_epubcheck_codes': _code_ids(initial_codes),
+            'final_epubcheck_codes': _code_ids(final_codes),
             'confirmed_safe_repairs': sorted(set(confirmed) & _DIAGNOSES),
             'original_valid': _boolean(result.get('original_valid') if repair else validation.get('valid')),
             'repair_attempted': attempted,
