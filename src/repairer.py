@@ -11,7 +11,7 @@ from . import diagnoser
 from .container_mutation import correct_rootfile_media_type
 from .diagnoser import diagnose_epub
 from .validator import EPUBCheckError, validate_epub
-from .zip_inspection import UnsafeZipError, inspect_local_headers
+from .zip_inspection import UnsafeZipError, check_archive_limits, inspect_local_headers
 
 
 MIMETYPE = b"application/epub+zip"
@@ -78,6 +78,7 @@ def _repair_epub(input_path: str, output_path: str, *, _validation_observer=None
                       remaining_messages=original["messages"])
         # Inspect directly, never extract archive-controlled paths to disk.
         with ZipFile(source) as archive:
+            check_archive_limits(archive)
             entries = archive.infolist()
             names = [entry.filename for entry in entries]
             if original["valid"]:

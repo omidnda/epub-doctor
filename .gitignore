@@ -31,6 +31,8 @@ Thumbs.db
 # Generated EPUB Doctor outputs
 repaired*.epub
 reports/
+/report.json
+/samples/book.epub
 # Local deployment configuration
 .env
 .env.*

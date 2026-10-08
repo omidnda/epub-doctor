@@ -8,6 +8,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 EPUBCHECK_JAR = PROJECT_ROOT / "vendor" / "epubcheck-5.4.0" / "epubcheck.jar"
 EPUBCHECK_TIMEOUT_SECONDS = 60
 EPUBCHECK_MAX_HEAP = "512m"
+MAX_EPUBCHECK_REPORT_BYTES = 32 * 1024 * 1024
 
 
 class EPUBCheckError(RuntimeError):
@@ -28,8 +29,8 @@ def validate_epub(epub_path: str) -> dict:
             result = subprocess.run(
                 ["java", f"-Xmx{EPUBCHECK_MAX_HEAP}", "-jar", str(EPUBCHECK_JAR), str(epub_path),
                  "--json", str(report_path)],
-                capture_output=True,
-                text=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
                 timeout=EPUBCHECK_TIMEOUT_SECONDS,
             )
         except subprocess.TimeoutExpired as exc:
@@ -43,12 +44,13 @@ def validate_epub(epub_path: str) -> dict:
             raise EPUBCheckError(f"Could not execute EPUBCheck: {exc}") from exc
 
         if result.returncode not in (0, 1):
-            detail = result.stderr.strip() or result.stdout.strip()
             raise EPUBCheckError(
-                f"EPUBCheck execution failed (exit {result.returncode}): {detail}"
+                f"EPUBCheck execution failed (exit {result.returncode})"
             )
         try:
             with report_path.open(encoding="utf-8") as report_file:
+                if report_path.stat().st_size > MAX_EPUBCHECK_REPORT_BYTES:
+                    raise EPUBCheckError("EPUBCheck JSON report exceeds 32 MiB limit")
                 report = json.load(report_file)
             checker = report["checker"]
             counts = [checker[key] for key in ("nFatal", "nError", "nWarning")]

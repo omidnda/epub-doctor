@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install Java and Python dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends openjdk-17-jre-headless
+          python -m pip install 'mcp==2.3.0' 'pytest>=8,<10'
+      - name: Run regression tests
+        run: python -m pytest -q
+      - name: Validate Compose configuration
+        env:
+          EPUB_DOCTOR_PUBLIC_ORIGIN: https://epubdoctor.example.org
+        run: docker compose config --quiet
+      - name: Build production image
+        run: docker build --tag epub-doctor:ci .

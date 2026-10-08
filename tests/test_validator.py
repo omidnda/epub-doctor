@@ -16,6 +16,8 @@ def fake_run(monkeypatch, payload, code=0):
         from pathlib import Path
         assert command[:3] == ["java", "-Xmx512m", "-jar"]
         assert kwargs["timeout"] == validator.EPUBCHECK_TIMEOUT_SECONDS
+        assert kwargs['stdout'] == kwargs['stderr'] == validator.subprocess.DEVNULL
+        assert 'capture_output' not in kwargs
         if payload is not None:
             Path(command[-1]).write_text(payload)
         return CompletedProcess(command, code, "", "test stderr")
@@ -48,6 +50,59 @@ def test_execution_failure(monkeypatch, tmp_path):
     fake_run(monkeypatch, None, 2)
     with pytest.raises(validator.EPUBCheckError, match="exit 2"):
         validator.validate_epub(str(path))
+
+
+def test_oversized_report_is_rejected_before_parse_and_cleaned(monkeypatch, tmp_path):
+    from pathlib import Path
+    source = tmp_path / 'input.epub'
+    source.touch()
+    reports = []
+    def run(command, **kwargs):
+        path = Path(command[-1])
+        reports.append(path)
+        with path.open('wb') as output:
+            output.truncate(validator.MAX_EPUBCHECK_REPORT_BYTES + 1)
+        return CompletedProcess(command, 0)
+    monkeypatch.setattr(validator.subprocess, 'run', run)
+    monkeypatch.setattr(validator.json, 'load', lambda *args: pytest.fail('Oversized report was parsed'))
+    with pytest.raises(validator.EPUBCheckError, match='report exceeds'):
+        validator.validate_epub(str(source))
+    assert not reports[0].parent.exists()
+
+
+def test_report_at_size_limit_is_accepted(monkeypatch, tmp_path):
+    source = tmp_path / 'input.epub'
+    source.touch()
+    payload = json.dumps(report())
+    monkeypatch.setattr(validator, 'MAX_EPUBCHECK_REPORT_BYTES', len(payload.encode('utf-8')))
+    fake_run(monkeypatch, payload)
+    assert validator.validate_epub(str(source))['valid'] is True
+
+
+@pytest.mark.parametrize('stage', ['initial', 'final'])
+def test_oversized_report_never_publishes(monkeypatch, make_epub, tmp_path, stage):
+    from pathlib import Path
+    from src import service
+    source = make_epub('missing')
+    before = source.read_bytes()
+    output = tmp_path / 'out.epub'
+    real_run = validator.subprocess.run
+    reports = []
+    def run(command, **kwargs):
+        reports.append(Path(command[-1]))
+        if stage == 'initial' or len(reports) == 2:
+            with reports[-1].open('wb') as target:
+                target.truncate(validator.MAX_EPUBCHECK_REPORT_BYTES + 1)
+            return CompletedProcess(command, 0)
+        return real_run(command, **kwargs)
+    monkeypatch.setattr(validator.subprocess, 'run', run)
+    result = service.repair_epub_file(str(source), str(output))
+    assert result['reason'] == 'epubcheck_failure'
+    assert result['output_file'] is None and result['repaired'] == []
+    assert source.read_bytes() == before
+    assert set(tmp_path.iterdir()) == {source}
+    assert len(reports) == (1 if stage == 'initial' else 2)
+    assert all(not path.parent.exists() for path in reports)
 
 
 def test_missing_java(monkeypatch, tmp_path):

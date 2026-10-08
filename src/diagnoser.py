@@ -9,7 +9,7 @@ from .manifest_mutation import _resolve_href
 from .identifier_mutation import correct_unique_identifier
 from .ncx_mutation import correct_ncx_identifier
 from .resource_manifest_mutation import add_referenced_resources
-from .zip_inspection import UnsafeZipError, inspect_local_headers
+from .zip_inspection import UnsafeZipError, check_archive_limits, inspect_local_headers
 
 
 class _NoDTDTreeBuilder(ElementTree.TreeBuilder):
@@ -357,6 +357,7 @@ def diagnose_epub(epub_path: str, validation_result: dict) -> list[str]:
             raise
         return []
     with archive:
+        check_archive_limits(archive)
         entries = archive.namelist()
         if "PKG-006" in message_ids:
             if "mimetype" not in entries:

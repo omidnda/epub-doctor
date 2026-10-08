@@ -3,11 +3,25 @@
 import struct
 from zipfile import ZIP_BZIP2, ZIP_DEFLATED, ZIP_LZMA, ZIP_STORED, ZIP64_LIMIT, ZipFile
 
+MAX_UNCOMPRESSED_ENTRY_BYTES = 64 * 1024 * 1024
+MAX_TOTAL_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
+
 
 class UnsafeZipError(ValueError):
     def __init__(self, reason: str, detail: str):
         super().__init__(detail)
         self.reason = reason
+
+
+def check_archive_limits(archive: ZipFile) -> None:
+    """Reject declared decompressed sizes before any entry content is read."""
+    total = 0
+    for entry in archive.infolist():
+        if entry.file_size > MAX_UNCOMPRESSED_ENTRY_BYTES:
+            raise UnsafeZipError("archive_entry_too_large", "ZIP entry exceeds 64 MiB uncompressed limit")
+        total += entry.file_size
+        if total > MAX_TOTAL_UNCOMPRESSED_BYTES:
+            raise UnsafeZipError("archive_total_too_large", "ZIP exceeds 256 MiB total uncompressed limit")
 
 
 def _check_extra(extra: bytes) -> None:

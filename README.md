@@ -507,8 +507,8 @@ refused before reading, and streaming byte accounting enforces the same limit
 when the header is missing or misleading. `DOWNLOAD_TIMEOUT_SECONDS=15` applies
 to socket connection/read operations. `DOWNLOAD_BUDGET_SECONDS=60` is checked
 between reads; it is not a hard deadline for OS DNS resolution or a blocking
-operation. These limits concern downloaded input bytes, not expanded ZIP size
-or EPUBCheck runtime; the existing core safety policy remains intact.
+operation. The 20 MiB cap concerns downloaded input bytes. Core diagnosis/repair
+also enforce the uncompressed archive limits documented below.
 
 Each call owns a private `TemporaryDirectory` with controlled `input.epub` and,
 for repair only, `repaired.epub`. Context-manager cleanup removes partial input
@@ -908,14 +908,35 @@ telemetry allowlists; unknown values are omitted/null.
 Every EPUBCheck invocation has a 60-second timeout (`EPUBCHECK_TIMEOUT_SECONDS`
 in `src/validator.py`), including initial validation and repair revalidation.
 Python's `subprocess.run` kills and waits for the Java child on timeout. The
-validator raises `EPUBCheckError` with a fixed technical message, without copying
-captured stdout/stderr. Its temporary report directory is cleaned up.
+validator raises `EPUBCheckError` with a fixed technical message. Java stdout and
+stderr go to `DEVNULL`, including on execution failure; only the exit code is
+reported. Its temporary report directory is cleaned up.
 Inspect propagates this error; repair returns the existing `epubcheck_failure`
 result, removes temporary repair files and publishes no output. There is no retry.
 
 This limit is per checker invocation, not a total request deadline: a repair can
-run two validations. Process creation may delay timeout delivery. This change
-does not impose memory, captured-output, request-concurrency or ZIP parsing limits.
+run two validations. Process creation may delay timeout delivery.
+
+The validator rejects JSON reports above 32 MiB (`MAX_EPUBCHECK_REPORT_BYTES`)
+before `json.load`. This bounds report input bytes, not the exact memory occupied
+by decoded Python objects. Java can still write a larger report before exiting;
+production's 128 MiB `/tmp` tmpfs bounds temporary storage, and the validator
+removes its report directory on success and failure.
+
+## Uncompressed archive limits
+
+Core repair checks every `ZipInfo.file_size` before diagnosis, entry reads or
+mutation: each entry must be at most 64 MiB (`MAX_UNCOMPRESSED_ENTRY_BYTES`), and
+their sum at most 256 MiB (`MAX_TOTAL_UNCOMPRESSED_BYTES`). Exact limits are
+accepted. These checks use declared sizes without decompressing the input;
+they are safety gates, not independent EPUB validation or repair evidence.
+Repair refuses larger archives with `archive_entry_too_large` or
+`archive_total_too_large`, leaves the source unchanged and creates no output.
+Diagnosis applies the same gate before reading entries for supported repairs;
+inspection propagates `UnsafeZipError` for oversized archives in that path.
+Existing bounded XML reads and local/central ZIP consistency checks remain.
+Rebuilding still reads one accepted entry at a time; these limits complement
+Java heap and container memory caps rather than guaranteeing a fixed process RSS.
 
 
 ## Concurrent EPUB operations
@@ -1027,7 +1048,8 @@ also disabled because errors can include bearer-token download URLs; app logs
 remain available with bounded Docker log rotation.
 
 Rate-limit keys use the actual connecting peer, not untrusted forwarded headers.
-Behind a single TLS proxy/tunnel, users may share one peer bucket. For per-user-IP
+Behind a single TLS proxy/tunnel or Docker gateway, users may share one peer
+bucket; this configuration does not guarantee a per-user rate limit. For per-user-IP
 limits, explicitly configure Nginx's real-IP module with only the trusted proxy
 addresses, or apply those limits at the outer TLS proxy. Never trust forwarded
 addresses from arbitrary clients. The shared global limit remains in force.
@@ -1052,3 +1074,18 @@ in-flight input workspaces. `docker compose down` retains the volume; `down -v`
 permanently removes stored outputs and telemetry. Docker image tags and transitive
 Python dependencies should be locked to reviewed digests/versions for repeatable
 release builds; there is no new application dependency or Celery service.
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on pushes to `main` and pull requests. It uses
+Python 3.12 and Java 17 on Ubuntu 24.04, installs the tested MCP SDK 2.3.0 and
+pytest, runs the full regression suite, validates Compose with an example public
+origin, then builds the production Docker image. The job has a 45-minute limit
+and read-only repository permissions. New updates cancel an older run for the
+same branch/PR. Configure the `test-and-build` check as required in GitHub branch
+protection if merges must wait for CI success.
+
+The workflow uses the documented v7 interfaces of
+[checkout](https://github.com/actions/checkout) and
+[setup-python](https://github.com/actions/setup-python). Actual hosted CI results
+are available only after the workflow is pushed and GitHub Actions runs it.
